@@ -75,7 +75,7 @@ Production deployment is handled automatically via the GitHub Actions workflow d
 
 ## Usage
 
-### 1. HTTP API
+### 1. HTTP API (Email)
 **Endpoint:** `POST /notify`
 ```bash
 curl -X POST http://localhost:8000/notify \
@@ -88,5 +88,24 @@ curl -X POST http://localhost:8000/notify \
   }'
 ```
 
-### 2. SMTP Gateway
+### 2. HTTP API (Discord Alerts)
+**Endpoint:** `POST /notify/discord` (or `POST /notify` with `"channel": "discord"`)
+```bash
+curl -X POST http://iris:8000/notify/discord \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "charon-sync",
+    "title": "Bisync Failed",
+    "details": "Cache state missing, triggering full resync.",
+    "severity": "error",
+    "bot_name": "Charon"
+  }'
+```
+
+Features:
+- **Thread Tracking:** Automatically creates a thread in Discord Forum channels and reuses the same thread for follow-up alerts.
+- **Anti-Spam Cooldown:** Automatically throttles repeated alerts during loops (default 30m).
+- **Bot Customization:** Overrides username (`bot_name`) per stack so alerts appear as distinct bots in Discord.
+
+### 3. SMTP Gateway
 Connect legacy services to port **2525**. Incoming mail will be relayed via the configured SES identity.

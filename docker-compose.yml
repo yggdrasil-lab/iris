@@ -34,6 +34,8 @@ services:
       - EMAIL_SENDER
       - ENV
       - TZ=Pacific/Auckland
+      - DISCORD_ALERTS_WEBHOOK_URL=${DISCORD_ALERTS_WEBHOOK_URL}
+      - DISCORD_USER_ID=${DISCORD_USER_ID}
     networks:
       - aether-net
     secrets:

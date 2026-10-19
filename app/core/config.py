@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     AWS_REGION: str = "ap-southeast-2"
     EMAIL_SENDER: str  # Verified SES identity email
     ENV: Optional[str] = None
+    DISCORD_ALERTS_WEBHOOK_URL: Optional[str] = None
+    DISCORD_USER_ID: Optional[str] = None
+    DISCORD_DEFAULT_COOLDOWN_SECONDS: int = 1800
 
     model_config = SettingsConfigDict(
         env_file=".env",
