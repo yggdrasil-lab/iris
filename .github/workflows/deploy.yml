@@ -1,4 +1,4 @@
-name: Deploy Hermes
+name: Deploy Iris
 
 on:
   push:
@@ -12,8 +12,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Log in to Registry
         uses: docker/login-action@v3
@@ -26,11 +24,11 @@ jobs:
         env:
           AWS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
         run: |
-          chmod +x scripts/ensure_secret.sh
-          echo "HERMES_AWS_ACCESS_KEY_ID_NAME=$(echo "$AWS_KEY" | ./scripts/ensure_secret.sh hermes_aws_access_key_id)" >> $GITHUB_ENV
-          echo "HERMES_AWS_SECRET_ACCESS_KEY_NAME=$(echo "$AWS_SECRET" | ./scripts/ensure_secret.sh hermes_aws_secret_access_key)" >> $GITHUB_ENV
+          curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/ensure_secret.sh -o /tmp/ensure_secret.sh
+          chmod +x /tmp/ensure_secret.sh
+          echo "IRIS_AWS_ACCESS_KEY_ID_NAME=$(echo "$AWS_KEY" | /tmp/ensure_secret.sh iris_aws_access_key_id)" >> $GITHUB_ENV
+          echo "IRIS_AWS_SECRET_ACCESS_KEY_NAME=$(echo "$AWS_SECRET" | /tmp/ensure_secret.sh iris_aws_secret_access_key)" >> $GITHUB_ENV
 
       - name: Build and Deploy with Docker Compose
         env:
@@ -39,5 +37,6 @@ jobs:
           ENV: ${{ vars.ENV }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
         run: |
-          chmod +x scripts/deploy.sh
-          ./scripts/deploy.sh "hermes" docker-compose.yml
+          curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
+          chmod +x /tmp/deploy.sh
+          /tmp/deploy.sh "iris" docker-compose.yml

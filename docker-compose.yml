@@ -1,20 +1,34 @@
 services:
-  hermes:
-    image: ${REGISTRY_PREFIX}hermes:${STACK_NAME:-latest}
+  iris:
+    image: ${REGISTRY_PREFIX}iris:${STACK_NAME:-latest}
     build: ./app
     labels:
       - "com.docker.compose.project=${STACK_NAME}"
     ports:
       - "8000:8000"
       - "2525:2525"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
           - node.role == manager
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+        reservations:
+          memory: 64M
       restart_policy:
-        condition: on-failure
+        condition: any
+        delay: 5s
+        window: 120s
     environment:
       - AWS_REGION
       - EMAIL_SENDER
@@ -23,19 +37,18 @@ services:
     networks:
       - aether-net
     secrets:
-      - source: hermes_aws_access_key_id
+      - source: iris_aws_access_key_id
         target: AWS_ACCESS_KEY_ID
-      - source: hermes_aws_secret_access_key
+      - source: iris_aws_secret_access_key
         target: AWS_SECRET_ACCESS_KEY
-    restart: unless-stopped
 
 secrets:
-  hermes_aws_access_key_id:
+  iris_aws_access_key_id:
     external: true
-    name: ${HERMES_AWS_ACCESS_KEY_ID_NAME}
-  hermes_aws_secret_access_key:
+    name: ${IRIS_AWS_ACCESS_KEY_ID_NAME}
+  iris_aws_secret_access_key:
     external: true
-    name: ${HERMES_AWS_SECRET_ACCESS_KEY_NAME}
+    name: ${IRIS_AWS_SECRET_ACCESS_KEY_NAME}
 
 networks:
   aether-net:

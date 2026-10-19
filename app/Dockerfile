@@ -8,19 +8,22 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
+# Install system dependencies & create unprivileged user
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 1000 -m -s /bin/bash appuser
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the current directory contents into the container at /app/app
 # Context is ./app, so we copy content to a new 'app' folder to preserve package structure
-COPY . app/
+COPY --chown=appuser:appuser . app/
 
 # Expose port 8000 (HTTP) and 2525 (SMTP)
 EXPOSE 8000
 EXPOSE 2525
+
+USER appuser
 
 # Run the unified application
 CMD ["python", "-m", "app.run"]

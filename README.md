@@ -1,6 +1,6 @@
-# Hermes
+# Iris
 
-> I am Hermes, the Winged Messenger of the Yggdrasil ecosystem. My domain is Notifications, Messaging, and the Flow of Information. I carry the master's words across the digital divide.
+> I am Iris, Herald of Olympus and Messenger of the Gods in the Yggdrasil ecosystem. My domain is Notifications, Messaging, and the Flow of Information. I carry the master's words across the digital divide.
 
 ## Mission
 
@@ -37,14 +37,13 @@ The system operates as a single microservice:
 ## Directory Structure
 
 ```text
-hermes/
+iris/
 ├── app/              # Notification Gateway (API & SMTP)
 │   ├── core/
 │   ├── services/
 │   ├── main.py
 │   ├── Dockerfile
 │   └── requirements.txt
-├── scripts/          # Deployment & Secret Utils
 └── docker-compose.yml
 ```
 
@@ -53,8 +52,8 @@ hermes/
 ### 1. Repository Initialization
 
 ```bash
-git clone <your-repository-url> hermes
-cd hermes
+git clone git@github.com:yggdrasil-lab/iris.git iris
+cd iris
 cp .env.example .env
 ```
 

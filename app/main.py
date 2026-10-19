@@ -1,9 +1,10 @@
+import asyncio
 from fastapi import FastAPI, HTTPException, status
 from app.models.schemas import NotificationRequest
 from app.services.email_service import EmailService
 from botocore.exceptions import ClientError
 
-app = FastAPI(title="Hermes Notification Gateway")
+app = FastAPI(title="Iris Notification Gateway")
 
 # Initialize services (lazy initialization or global instance)
 email_service = EmailService()
@@ -16,7 +17,8 @@ async def send_notification(request: NotificationRequest):
              raise HTTPException(status_code=400, detail="Subject is required for email channel")
         
         try:
-            response = email_service.send_email(
+            response = await asyncio.to_thread(
+                email_service.send_email,
                 recipient=request.recipient,
                 subject=request.subject,
                 body=request.body,
