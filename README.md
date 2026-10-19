@@ -54,7 +54,6 @@ iris/
 ```bash
 git clone git@github.com:yggdrasil-lab/iris.git iris
 cd iris
-cp .env.example .env
 ```
 
 ### 2. Configuration
