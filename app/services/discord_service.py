@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import httpx
 from app.core.config import settings
-from app.models.schemas import DiscordAlertRequest
+from app.models.schemas import DiscordAlertRequest, TriageResult
 
 logger = logging.getLogger("iris.discord")
 
@@ -22,8 +22,50 @@ class DiscordService:
         # Key: "service:title", Value: {"last_sent": float, "thread_id": Optional[str], "count": int}
         self._incidents: Dict[str, Dict[str, Any]] = {}
 
-    async def send_alert(self, request: DiscordAlertRequest) -> Dict[str, Any]:
-        webhook_url = request.webhook_url or settings.DISCORD_ALERTS_WEBHOOK_URL
+    async def send_alert(
+        self,
+        request: DiscordAlertRequest,
+        triage_result: Optional[TriageResult] = None
+    ) -> Dict[str, Any]:
+        # Handle Jev suppression gate
+        if triage_result and triage_result.suppress:
+            logger.info(
+                "Alert '%s:%s' suppressed by Jev triage: %s",
+                request.service,
+                request.title,
+                triage_result.reason
+            )
+            return {
+                "status": "suppressed",
+                "reason": triage_result.reason,
+                "urgency_score": triage_result.urgency_score,
+                "confidence": triage_result.confidence,
+                "destination_channel": triage_result.destination_channel,
+                "thread_id": None
+            }
+
+        # Handle Jev Choice metrics routing (silent operational telemetry)
+        if triage_result and triage_result.destination_channel == "metrics":
+            logger.info("Alert '%s:%s' routed to silent metrics by Jev Choice primitive", request.service, request.title)
+            return {
+                "status": "metrics_logged",
+                "reason": "Routed to silent metrics by Jev Choice primitive",
+                "urgency_score": triage_result.urgency_score,
+                "confidence": triage_result.confidence,
+                "destination_channel": "metrics",
+                "thread_id": None
+            }
+
+        # Resolve webhook URL with dynamic Choice channel routing
+        if (
+            triage_result
+            and triage_result.destination_channel == "decisions"
+            and settings.DISCORD_DECISIONS_WEBHOOK_URL
+        ):
+            webhook_url = request.webhook_url or settings.DISCORD_DECISIONS_WEBHOOK_URL
+        else:
+            webhook_url = request.webhook_url or settings.DISCORD_ALERTS_WEBHOOK_URL
+
         if not webhook_url:
             raise ValueError("No Discord webhook URL provided and DISCORD_ALERTS_WEBHOOK_URL is not configured")
 
@@ -96,7 +138,8 @@ class DiscordService:
             title=request.title if not thread_id else f"{request.title} (Recurring)",
             details=request.details,
             thread_name=thread_name,
-            thread_id=thread_id
+            thread_id=thread_id,
+            triage_result=triage_result
         )
 
         # 4. Update Incident Cache
@@ -111,7 +154,8 @@ class DiscordService:
         return {
             "status": "delivered",
             "thread_id": new_thread_id,
-            "incident_count": incident_count
+            "incident_count": incident_count,
+            "triage": triage_result.model_dump() if triage_result else None
         }
 
     async def _dispatch_message(
@@ -126,21 +170,32 @@ class DiscordService:
         title: str,
         details: str,
         thread_name: Optional[str] = None,
-        thread_id: Optional[str] = None
+        thread_id: Optional[str] = None,
+        triage_result: Optional[TriageResult] = None
     ) -> Dict[str, Any]:
         color = SEVERITY_COLORS.get(severity, SEVERITY_COLORS["error"])
         icon = "🚨" if severity != "info" else "✅"
         timestamp = datetime.now(timezone.utc).isoformat()
 
+        fields = [
+            {"name": "Service", "value": f"`{service}`", "inline": True},
+            {"name": "Node", "value": f"`{node or 'yggdrasil'}`", "inline": True},
+            {"name": "Severity", "value": f"`{severity}`", "inline": True},
+        ]
+
+        if triage_result:
+            fields.append({
+                "name": "Jev Gating",
+                "value": f"Score `{triage_result.urgency_score}/10` · Conf `{triage_result.confidence:.2f}` · `{triage_result.destination_channel}`",
+                "inline": True
+            })
+
+        fields.append({"name": "Details", "value": f"```text\n{details}\n```"})
+
         embed = {
             "title": f"{icon} {service} Alert: {title}",
             "color": color,
-            "fields": [
-                {"name": "Service", "value": f"`{service}`", "inline": True},
-                {"name": "Node", "value": f"`{node or 'yggdrasil'}`", "inline": True},
-                {"name": "Severity", "value": f"`{severity}`", "inline": True},
-                {"name": "Details", "value": f"```text\n{details}\n```"}
-            ],
+            "fields": fields,
             "footer": {"text": "Yggdrasil Monitoring · Iris Gateway"},
             "timestamp": timestamp
         }
