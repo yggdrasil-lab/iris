@@ -87,7 +87,11 @@ class TriageService:
             },
             "destination_channel": {
                 "type": "choice",
-                "options": ["alerts", "decisions", "metrics"]
+                "criteria": {
+                    "alerts": "High-urgency technical alerts and system outages",
+                    "decisions": "Incidents or changes requiring operator approval or decisions",
+                    "metrics": "Benign telemetry or silent background metrics"
+                }
             }
         }
 
@@ -120,7 +124,7 @@ class TriageService:
         noul_data = answers.get("is_transient_noise", {})
         noul_prob = float(noul_data.get("noul", 0.0))
         is_transient = noul_prob >= 0.5
-        noul_conf = float(noul_data.get("confidence", 0.8))
+        noul_conf = float(noul_data.get("confidence") or (abs(noul_prob - 0.5) * 2))
 
         # 3. Parse Channel Routing (Choice)
         choice_data = answers.get("destination_channel", {})
@@ -130,7 +134,8 @@ class TriageService:
         choice_conf = float(choice_data.get("confidence", 0.8))
 
         # Overall calibrated confidence
-        overall_confidence = float(data.get("confidence", min(score_conf, noul_conf, choice_conf)))
+        raw_conf = data.get("confidence")
+        overall_confidence = float(raw_conf) if raw_conf is not None else min(score_conf, noul_conf, choice_conf)
 
         # Suppression Gate Decision
         # Suppress if confidence >= threshold AND (score < threshold OR is_transient is True)
