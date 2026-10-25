@@ -37,7 +37,11 @@ jobs:
           ENV: ${{ vars.ENV }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           DISCORD_ALERTS_WEBHOOK_URL: ${{ secrets.DISCORD_ALERTS_WEBHOOK_URL }}
+          DISCORD_DECISIONS_WEBHOOK_URL: ${{ secrets.DISCORD_DECISIONS_WEBHOOK_URL }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          MUNINN_API_BASE: ${{ vars.MUNINN_API_BASE }}
+          IRIS_ALERT_TRIAGE_ENABLED: ${{ vars.IRIS_ALERT_TRIAGE_ENABLED }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
           chmod +x /tmp/deploy.sh

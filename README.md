@@ -107,5 +107,48 @@ Features:
 - **Anti-Spam Cooldown:** Automatically throttles repeated alerts during loops (default 30m).
 - **Bot Customization:** Overrides username (`bot_name`) per stack so alerts appear as distinct bots in Discord.
 
-### 3. SMTP Gateway
+### 3. Jev Decision Triage Gate (`POST /triage/alert`)
+Explicitly evaluate operational urgency (Score 1-10), noise suppression (Noul), and channel routing (Choice) using TypeSafe Jev System One without dispatching notifications:
+```bash
+curl -X POST http://iris:8000/triage/alert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "charon-sync",
+    "title": "Bisync Failed",
+    "details": "Cache state missing, triggering full resync.",
+    "severity": "error",
+    "node": "gaia"
+  }'
+```
+Response:
+```json
+{
+  "urgency_score": 8,
+  "confidence": 0.95,
+  "is_transient_noise": false,
+  "destination_channel": "alerts",
+  "suppress": false,
+  "reason": "Actionable alert passed: score 8/10 >= 7 (confidence: 0.95)",
+  "provider": "typesafe-jev"
+}
+```
+
+### 4. Prometheus Alertmanager Webhook (`POST /webhook/alertmanager`)
+Centralized webhook receiver for Prometheus Alertmanager, cAdvisor, and container healthchecks. Evaluates incoming alerts through the Jev triage gate, suppresses transient deployment/restart blips, and delivers actionable incidents to Discord:
+```bash
+curl -X POST http://iris:8000/webhook/alertmanager \
+  -H "Content-Type: application/json" \
+  -d '{
+    "status": "firing",
+    "alerts": [
+      {
+        "status": "firing",
+        "labels": {"alertname": "ContainerRestarting", "service": "apollo-core", "severity": "warning"},
+        "annotations": {"summary": "Apollo Core container restarting", "description": "Rolling deploy in progress"}
+      }
+    ]
+  }'
+```
+
+### 5. SMTP Gateway
 Connect legacy services to port **2525**. Incoming mail will be relayed via the configured SES identity.
