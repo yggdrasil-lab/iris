@@ -42,6 +42,9 @@ jobs:
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           MUNINN_API_BASE: ${{ vars.MUNINN_API_BASE }}
           IRIS_ALERT_TRIAGE_ENABLED: ${{ vars.IRIS_ALERT_TRIAGE_ENABLED }}
+          KANBAN_GATEWAY_URL: ${{ vars.KANBAN_GATEWAY_URL || 'http://huginn-gateway:8643' }}
+          IRIS_KANBAN_AUTO_TRIAGE: ${{ vars.IRIS_KANBAN_AUTO_TRIAGE || 'true' }}
+          IRIS_KANBAN_MIN_SCORE: ${{ vars.IRIS_KANBAN_MIN_SCORE || '8' }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
           chmod +x /tmp/deploy.sh
