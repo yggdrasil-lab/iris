@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     IRIS_ALERT_SCORE_THRESHOLD: int = 7
     IRIS_ALERT_CONFIDENCE_THRESHOLD: float = 0.80
 
+    # Autonomous Kanban Swarm Remediation Pipeline
+    KANBAN_GATEWAY_URL: Optional[str] = "http://huginn-gateway:8643"
+    IRIS_KANBAN_AUTO_TRIAGE: bool = True
+    IRIS_KANBAN_MIN_SCORE: int = 8
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

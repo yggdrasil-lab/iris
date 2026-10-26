@@ -25,7 +25,8 @@ class DiscordService:
     async def send_alert(
         self,
         request: DiscordAlertRequest,
-        triage_result: Optional[TriageResult] = None
+        triage_result: Optional[TriageResult] = None,
+        kanban_task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         # Handle Jev suppression gate
         if triage_result and triage_result.suppress:
@@ -139,7 +140,8 @@ class DiscordService:
             details=request.details,
             thread_name=thread_name,
             thread_id=thread_id,
-            triage_result=triage_result
+            triage_result=triage_result,
+            kanban_task_id=kanban_task_id,
         )
 
         # 4. Update Incident Cache
@@ -155,7 +157,8 @@ class DiscordService:
             "status": "delivered",
             "thread_id": new_thread_id,
             "incident_count": incident_count,
-            "triage": triage_result.model_dump() if triage_result else None
+            "triage": triage_result.model_dump() if triage_result else None,
+            "kanban_task_id": kanban_task_id,
         }
 
     async def _dispatch_message(
@@ -171,7 +174,8 @@ class DiscordService:
         details: str,
         thread_name: Optional[str] = None,
         thread_id: Optional[str] = None,
-        triage_result: Optional[TriageResult] = None
+        triage_result: Optional[TriageResult] = None,
+        kanban_task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         color = SEVERITY_COLORS.get(severity, SEVERITY_COLORS["error"])
         icon = "🚨" if severity != "info" else "✅"
@@ -187,6 +191,13 @@ class DiscordService:
             fields.append({
                 "name": "Jev Gating",
                 "value": f"Score `{triage_result.urgency_score}/10` · Conf `{triage_result.confidence:.2f}` · `{triage_result.destination_channel}`",
+                "inline": True
+            })
+
+        if kanban_task_id:
+            fields.append({
+                "name": "Remediation Task",
+                "value": f"`{kanban_task_id}` (`swarm-worker`)",
                 "inline": True
             })
 
