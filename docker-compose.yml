@@ -1,18 +1,54 @@
 services:
+  iris-db:
+    image: postgres:16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+    environment:
+      - POSTGRES_USER=iris
+      - POSTGRES_DB=iris
+      - POSTGRES_PASSWORD_FILE=/run/secrets/iris_db_password
+      - TZ=Pacific/Auckland
+    volumes:
+      - ${IRIS_DB_MOUNT_PATH}:/var/lib/postgresql/data
+    secrets:
+      - iris_db_password
+    networks:
+      - aether-net
+    labels:
+      - "com.docker.compose.project=${STACK_NAME}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iris -d iris"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      update_config:
+        parallelism: 1
+        order: stop-first
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
   iris:
-    image: ${REGISTRY_PREFIX}iris:${STACK_NAME:-latest}
+    image: ${REGISTRY_PREFIX}iris:${IMAGE_TAG}
     build: ./app
     labels:
       - "com.docker.compose.project=${STACK_NAME}"
-    ports:
-      - "8000:8000"
-      - "2525:2525"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     deploy:
       mode: replicated
       replicas: 1
@@ -22,27 +58,58 @@ services:
       resources:
         limits:
           cpus: '0.50'
-          memory: 256M
+          memory: 512M
         reservations:
-          memory: 64M
+          memory: 128M
       restart_policy:
         condition: any
         delay: 5s
         window: 120s
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=aether-net"
+        - "traefik.http.services.iris-svc.loadbalancer.server.port=8000"
+        - "traefik.http.middlewares.iris-strip-authentik.headers.customrequestheaders.X-authentik-username="
+        - "traefik.http.middlewares.iris-strip-authentik.headers.customrequestheaders.X-authentik-email="
+        - "traefik.http.middlewares.iris-strip-authentik.headers.customrequestheaders.X-authentik-groups="
+        - "traefik.http.middlewares.iris-strip-authentik.headers.customrequestheaders.X-authentik-name="
+        - "traefik.http.middlewares.iris-strip-authentik.headers.customrequestheaders.X-authentik-uid="
+        - "traefik.http.routers.iris-webhook-email.rule=Host(`iris.${DOMAIN_NAME}`) && Path(`/webhook/email`)"
+        - "traefik.http.routers.iris-webhook-email.entrypoints=websecure"
+        - "traefik.http.routers.iris-webhook-email.tls=true"
+        - "traefik.http.routers.iris-webhook-email.tls.certresolver=cloudflare"
+        - "traefik.http.routers.iris-webhook-email.priority=30"
+        - "traefik.http.routers.iris-webhook-email.middlewares=iris-strip-authentik"
+        - "traefik.http.routers.iris-webhook-email.service=iris-svc"
+        - "traefik.http.routers.iris-api.rule=Host(`iris.${DOMAIN_NAME}`) && PathPrefix(`/api`)"
+        - "traefik.http.routers.iris-api.entrypoints=websecure"
+        - "traefik.http.routers.iris-api.tls=true"
+        - "traefik.http.routers.iris-api.tls.certresolver=cloudflare"
+        - "traefik.http.routers.iris-api.priority=20"
+        - "traefik.http.routers.iris-api.middlewares=authentik@docker"
+        - "traefik.http.routers.iris-api.service=iris-svc"
     environment:
-      - AWS_REGION
-      - EMAIL_SENDER
-      - ENV
+      - AWS_REGION=${AWS_REGION}
+      - EMAIL_SENDER=${EMAIL_SENDER}
+      - ENV=${ENV}
       - TZ=Pacific/Auckland
+      - IRIS_DB_HOST=iris-db
+      - IRIS_DB_PORT=5432
+      - IRIS_DB_NAME=iris
+      - IRIS_DB_USER=iris
       - DISCORD_ALERTS_WEBHOOK_URL=${DISCORD_ALERTS_WEBHOOK_URL}
       - DISCORD_DECISIONS_WEBHOOK_URL=${DISCORD_DECISIONS_WEBHOOK_URL}
       - DISCORD_USER_ID=${DISCORD_USER_ID}
       - TYPESAFE_API_KEY=${TYPESAFE_API_KEY}
       - MUNINN_API_BASE=${MUNINN_API_BASE}
+      - MUNINN_API_KEY=${MUNINN_API_KEY}
       - IRIS_ALERT_TRIAGE_ENABLED=${IRIS_ALERT_TRIAGE_ENABLED}
       - KANBAN_GATEWAY_URL=${KANBAN_GATEWAY_URL}
       - IRIS_KANBAN_AUTO_TRIAGE=${IRIS_KANBAN_AUTO_TRIAGE}
       - IRIS_KANBAN_MIN_SCORE=${IRIS_KANBAN_MIN_SCORE}
+      - PLUTUS_API_URL=${PLUTUS_API_URL}
+      - PLUTUS_WEBHOOK_SECRET=${PLUTUS_WEBHOOK_SECRET}
+      - IRIS_PLUTUS_DISPATCH_ENABLED=${IRIS_PLUTUS_DISPATCH_ENABLED}
     networks:
       - aether-net
     secrets:
@@ -50,6 +117,10 @@ services:
         target: AWS_ACCESS_KEY_ID
       - source: iris_aws_secret_access_key
         target: AWS_SECRET_ACCESS_KEY
+      - source: iris_db_password
+        target: IRIS_DB_PASSWORD
+      - source: iris_webhook_secret
+        target: IRIS_WEBHOOK_SECRET
 
 secrets:
   iris_aws_access_key_id:
@@ -58,6 +129,12 @@ secrets:
   iris_aws_secret_access_key:
     external: true
     name: ${IRIS_AWS_SECRET_ACCESS_KEY_NAME}
+  iris_db_password:
+    external: true
+    name: ${IRIS_DB_PASSWORD_NAME}
+  iris_webhook_secret:
+    external: true
+    name: ${IRIS_WEBHOOK_SECRET_NAME}
 
 networks:
   aether-net:

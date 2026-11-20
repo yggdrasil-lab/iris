@@ -219,7 +219,8 @@ class DiscordService:
         if avatar_url:
             payload["avatar_url"] = avatar_url
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        headers = {"User-Agent": "Yggdrasil-Iris/1.0 (DiscordBot)"}
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
             # Case A: Post into existing thread
             if thread_id:
                 url = f"{webhook_url}?thread_id={thread_id}&wait=true"

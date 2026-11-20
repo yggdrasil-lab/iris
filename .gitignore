@@ -152,3 +152,8 @@ cython_debug/
 .DS_Store
 
 docker-compose.override.yml
+
+# Cloudflare Email Worker
+email-worker/node_modules/
+email-worker/.wrangler/
+email-worker/dist/
