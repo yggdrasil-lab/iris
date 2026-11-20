@@ -1,6 +1,8 @@
 name = "iris-email-worker"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
+workers_dev = false
+preview_urls = false
 
 # Configure non-secret runtime variables via Cloudflare Dashboard or deploy vars:
 # IRIS_WEBHOOK_URL = "https://iris.example.com/webhook/email"
