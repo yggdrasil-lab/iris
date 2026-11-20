@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the current directory contents into the container at /app/app
 # Context is ./app, so we copy content to a new 'app' folder to preserve package structure
 COPY --chown=appuser:appuser . app/
+COPY --chown=appuser:appuser entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Expose port 8000 (HTTP) and 2525 (SMTP)
 EXPOSE 8000
@@ -25,5 +27,5 @@ EXPOSE 2525
 
 USER appuser
 
-# Run the unified application
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "-m", "app.run"]

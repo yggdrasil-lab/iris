@@ -12,6 +12,7 @@ from app.models.schemas import (
     NotificationRequest,
     TriageResult,
 )
+from app.routers import api_emails, webhook_email
 from app.services.email_service import EmailService
 from app.services.discord_service import DiscordService
 from app.services.triage_service import TriageService
@@ -20,6 +21,8 @@ from app.services.kanban_service import KanbanService
 logger = logging.getLogger("iris")
 
 app = FastAPI(title="Iris Notification Gateway")
+app.include_router(webhook_email.router)
+app.include_router(api_emails.router)
 
 # Initialize services
 email_service = EmailService()
@@ -64,7 +67,8 @@ async def send_notification(request: NotificationRequest):
             bot_name=request.bot_name,
             avatar_url=request.avatar_url,
             user_id=request.user_id,
-            webhook_url=request.webhook_url,
+            channel_id=request.channel_id,
+            destination_channel=request.destination_channel,
             cooldown_seconds=request.cooldown_seconds,
             node=request.node,
             triage=request.triage
@@ -84,6 +88,7 @@ async def send_discord_alert(request: DiscordAlertRequest):
             else settings.IRIS_ALERT_TRIAGE_ENABLED
         )
 
+        triage_result = None
         kanban_task_id = None
         # Only evaluate triage for active alerts; resolutions (info) bypass gating
         if should_triage and request.severity != "info":

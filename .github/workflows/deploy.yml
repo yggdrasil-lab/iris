@@ -2,16 +2,77 @@ name: Deploy Iris
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: [self-hosted, gaia]
-    
+    env:
+      ENV: production
+      IMAGE_TAG: iris
+      IRIS_DB_MOUNT_PATH: /opt/iris/data
+      MUNINN_API_BASE: http://muninn:4000/v1
+      MUNINN_JEV_MODEL: jev-decision
+      KANBAN_GATEWAY_URL: http://huginn-gateway:8643
+      IRIS_KANBAN_AUTO_TRIAGE: "true"
+      IRIS_KANBAN_MIN_SCORE: "8"
+      PLUTUS_API_URL: http://plutus-api:8000
+      IRIS_PLUTUS_DISPATCH_ENABLED: "false"
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Validate Required Configuration
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_RAW_PASSWORD: ${{ secrets.REGISTRY_RAW_PASSWORD }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          MUNINN_MASTER_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
+          IRIS_DB_PASSWORD: ${{ secrets.IRIS_DB_PASSWORD }}
+          IRIS_WEBHOOK_SECRET: ${{ secrets.IRIS_WEBHOOK_SECRET }}
+          PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER }}
+          DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
+          DISCORD_CHANNEL_ALERT_ID: ${{ vars.DISCORD_CHANNEL_ALERT_ID }}
+          DISCORD_CHANNEL_INFO_ID: ${{ vars.DISCORD_CHANNEL_INFO_ID }}
+          DISCORD_CHANNEL_HEALTH_ID: ${{ vars.DISCORD_CHANNEL_HEALTH_ID }}
+          DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
+          IRIS_ALERT_TRIAGE_ENABLED: ${{ vars.IRIS_ALERT_TRIAGE_ENABLED }}
+        run: |
+          MISSING=""
+          [ -z "$REGISTRY_USERNAME" ] && MISSING="$MISSING REGISTRY_USERNAME"
+          [ -z "$REGISTRY_RAW_PASSWORD" ] && MISSING="$MISSING REGISTRY_RAW_PASSWORD"
+          [ -z "$AWS_ACCESS_KEY_ID" ] && MISSING="$MISSING AWS_ACCESS_KEY_ID"
+          [ -z "$AWS_SECRET_ACCESS_KEY" ] && MISSING="$MISSING AWS_SECRET_ACCESS_KEY"
+          [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
+          [ -z "$MUNINN_MASTER_KEY" ] && MISSING="$MISSING MUNINN_MASTER_KEY"
+          [ -z "$IRIS_DB_PASSWORD" ] && MISSING="$MISSING IRIS_DB_PASSWORD"
+          [ -z "$IRIS_WEBHOOK_SECRET" ] && MISSING="$MISSING IRIS_WEBHOOK_SECRET"
+          if [ "${IRIS_PLUTUS_DISPATCH_ENABLED}" = "true" ] && [ -z "$PLUTUS_WEBHOOK_SECRET" ]; then
+            MISSING="$MISSING PLUTUS_WEBHOOK_SECRET"
+          fi
+          [ -z "$DOMAIN_NAME" ] && MISSING="$MISSING DOMAIN_NAME"
+          [ -z "$REGISTRY_PREFIX" ] && MISSING="$MISSING REGISTRY_PREFIX"
+          [ -z "$AWS_REGION" ] && MISSING="$MISSING AWS_REGION"
+          [ -z "$EMAIL_SENDER" ] && MISSING="$MISSING EMAIL_SENDER"
+          [ -z "$DISCORD_USER_ID" ] && MISSING="$MISSING DISCORD_USER_ID"
+          [ -z "$DISCORD_CHANNEL_ALERT_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_ALERT_ID"
+          [ -z "$DISCORD_CHANNEL_INFO_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_INFO_ID"
+          [ -z "$DISCORD_CHANNEL_HEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_HEALTH_ID"
+          [ -z "$DISCORD_CHANNEL_WEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_WEALTH_ID"
+          [ -z "$IRIS_ALERT_TRIAGE_ENABLED" ] && MISSING="$MISSING IRIS_ALERT_TRIAGE_ENABLED"
+          [ -z "$IRIS_DB_MOUNT_PATH" ] && MISSING="$MISSING IRIS_DB_MOUNT_PATH"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Deployment halted: missing required configuration:$MISSING" >&2
+            exit 1
+          fi
 
       - name: Log in to Registry
         uses: docker/login-action@v3
@@ -20,31 +81,39 @@ jobs:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_RAW_PASSWORD }}
 
+      - name: Prepare host data directory
+        run: |
+          docker run --rm -v "${IRIS_DB_MOUNT_PATH}":/data alpine mkdir -p /data
+
       - name: Setup Secrets
         env:
           AWS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          DB_PASS: ${{ secrets.IRIS_DB_PASSWORD }}
+          WEBHOOK_SEC: ${{ secrets.IRIS_WEBHOOK_SECRET }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/ensure_secret.sh -o /tmp/ensure_secret.sh
           chmod +x /tmp/ensure_secret.sh
-          echo "IRIS_AWS_ACCESS_KEY_ID_NAME=$(echo "$AWS_KEY" | /tmp/ensure_secret.sh iris_aws_access_key_id)" >> $GITHUB_ENV
-          echo "IRIS_AWS_SECRET_ACCESS_KEY_NAME=$(echo "$AWS_SECRET" | /tmp/ensure_secret.sh iris_aws_secret_access_key)" >> $GITHUB_ENV
+          echo "IRIS_AWS_ACCESS_KEY_ID_NAME=$(printf '%s' "$AWS_KEY" | /tmp/ensure_secret.sh iris_aws_access_key_id)" >> $GITHUB_ENV
+          echo "IRIS_AWS_SECRET_ACCESS_KEY_NAME=$(printf '%s' "$AWS_SECRET" | /tmp/ensure_secret.sh iris_aws_secret_access_key)" >> $GITHUB_ENV
+          echo "IRIS_DB_PASSWORD_NAME=$(printf '%s' "$DB_PASS" | /tmp/ensure_secret.sh iris_db_password)" >> $GITHUB_ENV
+          echo "IRIS_WEBHOOK_SECRET_NAME=$(printf '%s' "$WEBHOOK_SEC" | /tmp/ensure_secret.sh iris_webhook_secret)" >> $GITHUB_ENV
 
       - name: Build and Deploy with Docker Compose
         env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER }}
-          ENV: ${{ vars.ENV }}
-          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
-          DISCORD_ALERTS_WEBHOOK_URL: ${{ secrets.DISCORD_ALERTS_WEBHOOK_URL }}
-          DISCORD_DECISIONS_WEBHOOK_URL: ${{ secrets.DISCORD_DECISIONS_WEBHOOK_URL }}
-          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
-          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
-          MUNINN_API_BASE: ${{ vars.MUNINN_API_BASE }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ALERT_ID: ${{ vars.DISCORD_CHANNEL_ALERT_ID }}
+          DISCORD_CHANNEL_INFO_ID: ${{ vars.DISCORD_CHANNEL_INFO_ID }}
+          DISCORD_CHANNEL_HEALTH_ID: ${{ vars.DISCORD_CHANNEL_HEALTH_ID }}
+          DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
+          DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
+          MUNINN_API_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           IRIS_ALERT_TRIAGE_ENABLED: ${{ vars.IRIS_ALERT_TRIAGE_ENABLED }}
-          KANBAN_GATEWAY_URL: ${{ vars.KANBAN_GATEWAY_URL || 'http://huginn-gateway:8643' }}
-          IRIS_KANBAN_AUTO_TRIAGE: ${{ vars.IRIS_KANBAN_AUTO_TRIAGE || 'true' }}
-          IRIS_KANBAN_MIN_SCORE: ${{ vars.IRIS_KANBAN_MIN_SCORE || '8' }}
+          PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
           chmod +x /tmp/deploy.sh

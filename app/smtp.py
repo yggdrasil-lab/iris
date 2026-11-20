@@ -32,14 +32,17 @@ class IrisSMTPHandler:
 
             # Determine safe SES sender
             # If incoming mail_from matches verified domain, use it; otherwise fallback to default EMAIL_SENDER
-            verified_domain = settings.EMAIL_SENDER.split("@")[-1].lower() if "@" in settings.EMAIL_SENDER else ""
+            default_sender = settings.EMAIL_SENDER
+            if not default_sender:
+                raise RuntimeError("EMAIL_SENDER is not configured")
+            verified_domain = default_sender.split("@")[-1].lower() if "@" in default_sender else ""
             mail_from = (envelope.mail_from or "").strip()
-            
+
             if mail_from and verified_domain and mail_from.lower().endswith(f"@{verified_domain}"):
                 sender = mail_from
                 reply_to = None
             else:
-                sender = settings.EMAIL_SENDER
+                sender = default_sender
                 reply_to = [mail_from] if mail_from else None
 
             # Iterate over recipients (SMTP allows multiple RCPT TO)

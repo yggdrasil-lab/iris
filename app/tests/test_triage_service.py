@@ -1,0 +1,156 @@
+"""Unit tests for centralized Muninn jev-decision TriageService."""
+
+import json
+from typing import Any
+
+import httpx
+import pytest
+
+from app.core.config import settings
+from app.services.triage_service import JevRouterUnavailableError, TriageService
+
+
+def _mock_async_client(monkeypatch, handler) -> None:
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
+            return await handler(url, json, headers or {})
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+
+@pytest.mark.asyncio
+async def test_muninn_jev_alert_triage_payload_suppression_and_missing_confidence(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+    monkeypatch.setattr(settings, "MUNINN_JEV_MODEL", "jev-decision")
+    monkeypatch.setattr(settings, "IRIS_ALERT_SCORE_THRESHOLD", 7)
+    monkeypatch.setattr(settings, "IRIS_ALERT_CONFIDENCE_THRESHOLD", 0.80)
+
+    captured: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+    next_response: dict[str, Any] = {
+        "urgency_score": "3",
+        "is_transient_noise": "true",
+        "destination_channel": "metrics",
+        "_confidence": 0.91,
+    }
+
+    async def fake_post(url: str, body: dict[str, Any], headers: dict[str, str]):
+        captured.append((url, body, headers))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(next_response)}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_post)
+    svc = TriageService()
+
+    # 1. Calibrated high-confidence transient noise -> suppressed
+    suppressed = await svc.evaluate_alert(
+        service="apollo",
+        title="Container restarting",
+        details="Rolling deploy",
+        severity="warning",
+        node="gaia",
+    )
+    assert suppressed.provider == "muninn-jev"
+    assert suppressed.urgency_score == 3
+    assert suppressed.is_transient_noise is True
+    assert suppressed.destination_channel == "metrics"
+    assert suppressed.suppress is True
+    assert suppressed.confidence == pytest.approx(0.91)
+
+    url, req_body, hdrs = captured[0]
+    assert url == "http://muninn.local/v1/chat/completions"
+    assert hdrs["Authorization"] == "Bearer muninn-master-key"
+    assert hdrs["User-Agent"] == "Yggdrasil-Iris/1.0"
+    assert req_body["model"] == "jev-decision"
+    assert req_body["temperature"] == 0.0
+    assert req_body["response_format"] == {"type": "json_object"}
+    assert '"include_meta": true' in req_body["messages"][0]["content"]
+    assert '"questions"' in req_body["messages"][0]["content"]
+
+    # 2. Missing _confidence -> defaults to 0.0 and escalates fail-open (suppress=False)
+    next_response = {
+        "urgency_score": 2,
+        "is_transient_noise": True,
+        "destination_channel": "alerts",
+    }
+    escalated = await svc.evaluate_alert(
+        service="apollo",
+        title="Container restarting",
+        details="Rolling deploy",
+        severity="warning",
+    )
+    assert escalated.provider == "muninn-jev"
+    assert escalated.confidence == 0.0
+    assert escalated.suppress is False
+
+
+@pytest.mark.asyncio
+async def test_muninn_jev_alert_triage_fails_open_when_unconfigured_or_error(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", None)
+
+    svc = TriageService()
+    res_unconf = await svc.evaluate_alert(
+        service="plutus",
+        title="DB error",
+        details="Connection reset",
+        severity="error",
+    )
+    assert res_unconf.provider == "fail-open-fallback"
+    assert res_unconf.suppress is False
+    assert res_unconf.urgency_score == 8
+
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    async def fake_err(url: str, body: dict[str, Any], headers: dict[str, str]):
+        return httpx.Response(503, text="down", request=httpx.Request("POST", url))
+
+    _mock_async_client(monkeypatch, fake_err)
+    res_503 = await svc.evaluate_alert(
+        service="plutus",
+        title="Slow query",
+        details="Timeout",
+        severity="warning",
+    )
+    assert res_503.provider == "fail-open-fallback"
+    assert res_503.suppress is False
+    assert res_503.urgency_score == 5
+
+
+@pytest.mark.asyncio
+async def test_muninn_jev_email_routing_rejects_bad_json_or_unknown_target(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    bad_payloads = ["not-json", '{"route_target":"unknown_route"}']
+    idx = {"i": 0}
+
+    async def fake_bad(url: str, body: dict[str, Any], headers: dict[str, str]):
+        content = bad_payloads[idx["i"]]
+        idx["i"] += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": content}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_bad)
+    svc = TriageService()
+
+    with pytest.raises(JevRouterUnavailableError, match="Invalid Muninn Jev JSON"):
+        await svc.route_inbound_email("a@b.com", "iris@b.com", "Subj", "2026-11-20T00:00:00Z", "body", [])
+
+    with pytest.raises(JevRouterUnavailableError, match="Invalid or missing route_target"):
+        await svc.route_inbound_email("a@b.com", "iris@b.com", "Subj", "2026-11-20T00:00:00Z", "body", [])
