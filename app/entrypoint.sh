@@ -12,7 +12,7 @@ if [ -z "${IRIS_WEBHOOK_SECRET:-}" ] && [ -f /run/secrets/IRIS_WEBHOOK_SECRET ];
 fi
 
 if [ -z "${DATABASE_URL:-}" ] && [ -n "${IRIS_DB_PASSWORD:-}" ]; then
-    DATABASE_URL=$(python -c 'import os, urllib.parse; print(f"postgresql+psycopg://{urllib.parse.quote_plus(os.environ.get(\"IRIS_DB_USER\", \"iris\"))}:{urllib.parse.quote_plus(os.environ[\"IRIS_DB_PASSWORD\"])}@{os.environ.get(\"IRIS_DB_HOST\", \"iris-db\")}:{os.environ.get(\"IRIS_DB_PORT\", \"5432\")}/{os.environ.get(\"IRIS_DB_NAME\", \"iris\")}")')
+    DATABASE_URL=$(python -c 'from app.core.config import settings; print(settings.resolved_database_url())')
     export DATABASE_URL
 fi
 
