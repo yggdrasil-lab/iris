@@ -1,6 +1,7 @@
 import base64
 from datetime import datetime, timezone
 import hashlib
+import html
 from html.parser import HTMLParser
 import logging
 import re
@@ -59,6 +60,39 @@ _BLOCK_HTML_TAGS = {
     "pre",
 }
 _INLINE_PAD_TAGS = {"td", "th"}
+_INVISIBLE_CHARS_RE = re.compile(r"[\u034f\u200b\u200c\u200d\u200e\u200f\u2007\u2060\u00ad\ufeff]+")
+_INVISIBLE_CODEPOINTS = {
+    0x034F,
+    0x200B,
+    0x200C,
+    0x200D,
+    0x200E,
+    0x200F,
+    0x2007,
+    0x2060,
+    0x00AD,
+    0xFEFF,
+}
+_INVISIBLE_ENTITY_NAMES = {"zwnj", "zwj", "lrm", "rlm", "shy"}
+_ANGLE_TRACKING_URL_RE = re.compile(r"<https?://[^>]+>", re.IGNORECASE)
+_LONG_TRACKING_URL_RE = re.compile(r"https?://\S{40,}", re.IGNORECASE)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_HEAD_RE = re.compile(r"<head\b[^>]*>.*?</head\s*>", re.IGNORECASE | re.DOTALL)
+_MAX_TRACKING_ATTR_LEN = 80
+
+
+def _strip_invisible_and_tracking(text: str) -> str:
+    """Remove invisible Unicode preheaders, tracking URLs, and redundant whitespace."""
+    if not text:
+        return ""
+    cleaned = _INVISIBLE_CHARS_RE.sub("", text)
+    cleaned = _ANGLE_TRACKING_URL_RE.sub("", cleaned)
+    cleaned = _LONG_TRACKING_URL_RE.sub("", cleaned)
+    lines = [re.sub(r"[ \t\r\f\v\u00a0]+", " ", line).strip() for line in cleaned.splitlines()]
+    non_empty = [line for line in lines if line]
+    return "\n".join(non_empty)
 
 
 class _PlainTextHTMLParser(HTMLParser):
@@ -97,10 +131,115 @@ class _PlainTextHTMLParser(HTMLParser):
             self._chunks.append(data)
 
     def get_text(self) -> str:
+        return _strip_invisible_and_tracking("".join(self._chunks))
+
+
+class _HTMLStorageCleaner(HTMLParser):
+    """Strip inline styles, tracking URLs, comments, and invisible spacers from HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._skip_depth = 0
+        self._chunks: List[str] = []
+
+    def _format_attrs(self, attrs: list[tuple[str, Optional[str]]]) -> str:
+        parts: List[str] = []
+        for name, value in attrs:
+            lowered = name.lower()
+            if lowered == "style":
+                continue
+            if lowered in ("href", "src") and value is not None and len(value.strip()) > _MAX_TRACKING_ATTR_LEN:
+                continue
+            if value is None:
+                parts.append(name)
+            else:
+                parts.append(f'{name}="{html.escape(value, quote=True)}"')
+        return (" " + " ".join(parts)) if parts else ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        lowered = tag.lower()
+        if lowered in ("script", "style"):
+            self._skip_depth += 1
+            return
+        if self._skip_depth == 0:
+            self._chunks.append(f"<{tag}{self._format_attrs(attrs)}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        lowered = tag.lower()
+        if lowered in ("script", "style"):
+            return
+        if self._skip_depth == 0:
+            self._chunks.append(f"<{tag}{self._format_attrs(attrs)} />")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered in ("script", "style"):
+            if self._skip_depth > 0:
+                self._skip_depth -= 1
+            return
+        if self._skip_depth == 0:
+            self._chunks.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0 and data:
+            self._chunks.append(_INVISIBLE_CHARS_RE.sub("", data))
+
+    def handle_entityref(self, name: str) -> None:
+        if self._skip_depth != 0:
+            return
+        lowered = name.lower()
+        if lowered in _INVISIBLE_ENTITY_NAMES:
+            return
+        if lowered == "nbsp":
+            self._chunks.append(" ")
+            return
+        self._chunks.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._skip_depth != 0:
+            return
+        try:
+            code = int(name[1:], 16) if name.lower().startswith("x") else int(name, 10)
+        except ValueError:
+            self._chunks.append(f"&#{name};")
+            return
+        if code in _INVISIBLE_CODEPOINTS:
+            return
+        if code == 0x00A0:
+            self._chunks.append(" ")
+            return
+        self._chunks.append(f"&#{name};")
+
+    def handle_comment(self, data: str) -> None:
+        return
+
+    def get_html(self) -> str:
         raw = "".join(self._chunks)
-        lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in raw.splitlines()]
+        lines = [re.sub(r"[ \t\r\f\v\u00a0]+", " ", line).strip() for line in raw.splitlines()]
         non_empty = [line for line in lines if line]
         return "\n".join(non_empty)
+
+
+def clean_html_for_storage(
+    html_body: Optional[str],
+    max_chars: int = MAX_STORED_BODY_CHARS,
+) -> Optional[str]:
+    """Strip bloated styles, scripts, head, comments, spacers, and long tracking URLs from HTML."""
+    if html_body is None:
+        return None
+    stripped = _HTML_COMMENT_RE.sub("", html_body)
+    stripped = _HTML_SCRIPT_RE.sub("", stripped)
+    stripped = _HTML_STYLE_RE.sub("", stripped)
+    stripped = _HTML_HEAD_RE.sub("", stripped)
+    stripped = _INVISIBLE_CHARS_RE.sub("", stripped)
+
+    parser = _HTMLStorageCleaner()
+    parser.feed(stripped)
+    parser.close()
+    cleaned = parser.get_html().strip()
+    if not cleaned:
+        return None
+    return cleaned[:max_chars]
 
 
 def sanitize_html_to_text(html_body: Optional[str]) -> str:
@@ -118,12 +257,9 @@ def build_raw_excerpt(
     html_body: Optional[str],
     max_chars: int = MAX_RAW_EXCERPT_CHARS,
 ) -> str:
-    """Build bounded plain-text excerpt preferring text_body over sanitized HTML."""
-    candidate = (text_body or "").strip()
-    if candidate:
-        lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in candidate.splitlines()]
-        normalized = "\n".join(line for line in lines if line)
-    else:
+    """Build bounded plain-text excerpt preferring cleaned text_body over sanitized HTML."""
+    normalized = _strip_invisible_and_tracking(text_body or "")
+    if not normalized:
         normalized = sanitize_html_to_text(html_body)
     return normalized[:max_chars]
 
@@ -275,7 +411,7 @@ async def _dispatch_to_plutus(email_row: InboundEmail) -> Tuple[int, str, Option
     target_url = f"{plutus_url.rstrip('/')}/integrations/email"
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(target_url, json=payload, headers=headers)
     except httpx.HTTPError as exc:
         return 503, "failed", f"plutus_network_error: {exc}"
@@ -441,7 +577,7 @@ async def ingest_email(
         subject=payload.subject or "",
         received_at=received_at,
         text_body=_truncate_body(payload.text_body),
-        html_excerpt=_truncate_body(payload.html_body),
+        html_excerpt=clean_html_for_storage(payload.html_body),
         raw_excerpt=raw_excerpt,
         attachments_meta=attachments_meta,
         route_target="unclassified",
@@ -611,6 +747,8 @@ async def retry_email(
 
     needs_classify = reclassify or email_row.route_target not in VALID_ROUTE_TARGETS or not email_row.jev_verdict
     if needs_classify:
+        if email_row.text_body is not None or email_row.html_excerpt is not None:
+            email_row.raw_excerpt = build_raw_excerpt(email_row.text_body, email_row.html_excerpt)
         try:
             verdict = await triage.route_inbound_email(
                 from_address=email_row.from_address,

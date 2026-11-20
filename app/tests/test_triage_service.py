@@ -154,3 +154,62 @@ async def test_muninn_jev_email_routing_rejects_bad_json_or_unknown_target(monke
 
     with pytest.raises(JevRouterUnavailableError, match="Invalid or missing route_target"):
         await svc.route_inbound_email("a@b.com", "iris@b.com", "Subj", "2026-11-20T00:00:00Z", "body", [])
+
+
+@pytest.mark.asyncio
+async def test_muninn_jev_email_routing_prompt_criteria_and_compact_currency(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_ok(url: str, body: dict[str, Any], headers: dict[str, str]):
+        captured.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "route_target": "plutus_dbs_alert",
+                                    "has_actionable_amount": "true",
+                                    "significance_score": "8",
+                                    "_confidence": 0.94,
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_ok)
+    svc = TriageService()
+
+    verdict = await svc.route_inbound_email(
+        from_address="ibanking.alert@dbs.com",
+        to_address="iris@example.com",
+        subject="iBanking Alerts - FAST Transfer",
+        received_at="2026-11-20T08:00:00Z",
+        raw_excerpt="Amount: SGD2000.00 to Example Recipient",
+        attachments_meta=[],
+    )
+    assert verdict.route_target == "plutus_dbs_alert"
+    assert verdict.has_actionable_amount is True
+    assert verdict.confidence == pytest.approx(0.94)
+    assert verdict.urgency_score == 8
+
+    system_content = captured[0]["messages"][0]["content"]
+    assert "iBanking Alerts" in system_content
+    assert "digibank Alert" in system_content
+    assert "ibanking.alert@dbs.com" in system_content
+    assert "bill payment" in system_content
+    assert "E-commerce order confirmation" in system_content
+    assert "Amazon" in system_content
+    assert "forwarded purchase receipt" in system_content
+    assert "SGD2000.00" in system_content
+    assert "$179.74" in system_content
+    assert "AUD" in system_content
