@@ -32,7 +32,7 @@ def _mock_async_client(monkeypatch, handler) -> None:
 async def test_discord_bot_forum_thread_creation_and_followup_reply(monkeypatch) -> None:
     monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "bot-token-123")
     monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", "111111")
-    monkeypatch.setattr(settings, "DISCORD_USER_ID", "302843723715182592")
+    monkeypatch.setattr(settings, "DISCORD_USER_ID", "100000000000000001")
 
     calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 
@@ -69,7 +69,7 @@ async def test_discord_bot_forum_thread_creation_and_followup_reply(monkeypatch)
     assert "username" not in body1
     assert "avatar_url" not in body1
     assert body1["name"].startswith("🚨 charon Alert: Bisync Failed")
-    assert body1["message"]["content"] == "<@302843723715182592>"
+    assert body1["message"]["content"] == "<@100000000000000001>"
     embed1 = body1["message"]["embeds"][0]
     assert embed1["author"] == {
         "name": "Charon Bot",
@@ -255,17 +255,41 @@ async def test_discord_fails_loud_when_token_or_channel_missing(monkeypatch) -> 
             DiscordAlertRequest(service="iris", title="Missing Token", details="Fail", severity="error")
         )
 
+    # Explicit destination channel must fail loud rather than falling back to ALERT_ID
     monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "bot-token-123")
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", None)
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", "ch-alert")
     monkeypatch.setattr(settings, "DISCORD_CHANNEL_HEALTH_ID", None)
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_INFO_ID", None)
 
-    with pytest.raises(ValueError, match="channel ID"):
+    with pytest.raises(ValueError, match="health"):
         await svc.send_alert(
             DiscordAlertRequest(
                 service="eir",
-                title="Missing Channel",
+                title="Missing Health Channel",
                 details="Fail",
                 severity="warning",
                 destination_channel="health",
+            )
+        )
+
+    with pytest.raises(ValueError, match="decisions"):
+        await svc.send_alert(
+            DiscordAlertRequest(
+                service="iris",
+                title="Missing Decisions Channel",
+                details="Fail",
+                severity="warning",
+                destination_channel="decisions",
+            )
+        )
+
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", None)
+    with pytest.raises(ValueError, match="alerts"):
+        await svc.send_alert(
+            DiscordAlertRequest(
+                service="iris",
+                title="Missing Default Alert Channel",
+                details="Fail",
+                severity="error",
             )
         )

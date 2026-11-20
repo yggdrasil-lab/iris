@@ -49,7 +49,10 @@ class DiscordService:
             "wealth": settings.DISCORD_CHANNEL_WEALTH_ID,
             "alerts": settings.DISCORD_CHANNEL_ALERT_ID,
         }
-        resolved = (channel_map.get(dest) or settings.DISCORD_CHANNEL_ALERT_ID or "").strip()
+        if dest in channel_map:
+            resolved = (channel_map[dest] or "").strip()
+        else:
+            resolved = (settings.DISCORD_CHANNEL_ALERT_ID or "").strip()
         if not resolved:
             raise ValueError(
                 f"Discord channel ID is not configured for destination '{dest}'"
