@@ -157,3 +157,10 @@ docker-compose.override.yml
 email-worker/node_modules/
 email-worker/.wrangler/
 email-worker/dist/
+
+# Iris Audit Web Dashboard
+web/node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
+

@@ -125,6 +125,55 @@ services:
       - source: iris_webhook_secret
         target: IRIS_WEBHOOK_SECRET
 
+  iris-web:
+    image: ${REGISTRY_PREFIX}iris-web:${IMAGE_TAG}
+    build: ./web
+    labels:
+      - "com.docker.compose.project=${STACK_NAME}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+      restart_policy:
+        condition: any
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=aether-net"
+        - "traefik.http.services.iris-web-svc.loadbalancer.server.port=8080"
+        - "traefik.http.routers.iris-web-pwa.rule=Host(`iris.${DOMAIN_NAME}`) && (Path(`/favicon.svg`) || Path(`/manifest.webmanifest`))"
+        - "traefik.http.routers.iris-web-pwa.entrypoints=websecure"
+        - "traefik.http.routers.iris-web-pwa.tls=true"
+        - "traefik.http.routers.iris-web-pwa.tls.certresolver=cloudflare"
+        - "traefik.http.routers.iris-web-pwa.priority=100"
+        - "traefik.http.routers.iris-web-pwa.service=iris-web-svc"
+        - "traefik.http.routers.iris-web.rule=Host(`iris.${DOMAIN_NAME}`)"
+        - "traefik.http.routers.iris-web.entrypoints=websecure"
+        - "traefik.http.routers.iris-web.tls=true"
+        - "traefik.http.routers.iris-web.tls.certresolver=cloudflare"
+        - "traefik.http.routers.iris-web.priority=10"
+        - "traefik.http.routers.iris-web.middlewares=authentik@docker"
+        - "traefik.http.routers.iris-web.service=iris-web-svc"
+        - "homepage.group=Infrastructure"
+        - "homepage.name=Iris Gateway"
+        - "homepage.icon=mdi-email-fast"
+        - "homepage.href=https://iris.${DOMAIN_NAME}"
+        - "homepage.description=Inbound Email Audit & Routing Gateway"
+    networks:
+      - aether-net
+
 secrets:
   iris_aws_access_key_id:
     external: true
