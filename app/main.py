@@ -67,7 +67,8 @@ async def send_notification(request: NotificationRequest):
             bot_name=request.bot_name,
             avatar_url=request.avatar_url,
             user_id=request.user_id,
-            webhook_url=request.webhook_url,
+            channel_id=request.channel_id,
+            destination_channel=request.destination_channel,
             cooldown_seconds=request.cooldown_seconds,
             node=request.node,
             triage=request.triage

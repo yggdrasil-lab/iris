@@ -219,6 +219,7 @@ async def _notify_discord_best_effort(
             title=title[:120],
             details=details[:1500],
             severity=severity,
+            destination_channel=channel,
             triage=False,
         )
         await discord_service.send_alert(req, triage_result=triage_hint)

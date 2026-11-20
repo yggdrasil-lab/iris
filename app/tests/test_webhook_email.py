@@ -200,14 +200,16 @@ def test_webhook_email_low_confidence_and_missing_receipt_amount_park_for_review
     client: TestClient, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "ts-key")
-    monkeypatch.setattr(settings, "DISCORD_DECISIONS_WEBHOOK_URL", "https://discord.example/decisions")
+    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "discord-bot-token")
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_INFO_ID", "chan-info-123")
 
     discord_posts: list[str] = []
 
     async def fake_post_low_conf(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.example" in url:
+        if "discord.com/api/v10" in url:
             discord_posts.append(url)
-            return httpx.Response(200, json={"channel_id": "thread-1"}, request=httpx.Request("POST", url))
+            assert headers.get("Authorization") == "Bot discord-bot-token"
+            return httpx.Response(200, json={"id": "thread-1"}, request=httpx.Request("POST", url))
         return httpx.Response(
             200,
             json=_make_typesafe_response("plutus_dbs_alert", has_amount_prob=0.9, confidence=0.55),
@@ -230,12 +232,12 @@ def test_webhook_email_low_confidence_and_missing_receipt_amount_park_for_review
     assert resp_low.status_code == 200
     assert resp_low.json()["dispatch_status"] == "needs_review"
     assert "low_confidence" in resp_low.json()["error_detail"]
-    assert len(discord_posts) == 1
+    assert discord_posts == ["https://discord.com/api/v10/channels/chan-info-123/threads"]
 
     async def fake_post_no_amount(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.example" in url:
+        if "discord.com/api/v10" in url:
             discord_posts.append(url)
-            return httpx.Response(200, json={"channel_id": "thread-2"}, request=httpx.Request("POST", url))
+            return httpx.Response(200, json={"id": "thread-2"}, request=httpx.Request("POST", url))
         return httpx.Response(
             200,
             json=_make_typesafe_response("plutus_purchase_receipt", has_amount_prob=0.1, confidence=0.94),
@@ -258,7 +260,10 @@ def test_webhook_email_low_confidence_and_missing_receipt_amount_park_for_review
     assert resp_no_amt.status_code == 200
     assert resp_no_amt.json()["dispatch_status"] == "needs_review"
     assert resp_no_amt.json()["error_detail"] == "receipt_missing_actionable_amount"
-    assert len(discord_posts) == 2
+    assert discord_posts == [
+        "https://discord.com/api/v10/channels/chan-info-123/threads",
+        "https://discord.com/api/v10/channels/chan-info-123/threads",
+    ]
 
 
 def test_webhook_email_muninn_fallback_and_fail_loud_503(
@@ -267,7 +272,8 @@ def test_webhook_email_muninn_fallback_and_fail_loud_503(
     monkeypatch.setattr(settings, "TYPESAFE_API_KEY", "ts-key")
     monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
     monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-secret-token")
-    monkeypatch.setattr(settings, "DISCORD_ALERTS_WEBHOOK_URL", "https://discord.example/alerts")
+    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "discord-bot-token")
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", "chan-alert-456")
 
     seen_auth_headers: list[tuple[str, str]] = []
 
@@ -314,9 +320,9 @@ def test_webhook_email_muninn_fallback_and_fail_loud_503(
     alert_posts: list[str] = []
 
     async def fake_all_fail(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.example" in url:
+        if "discord.com/api/v10" in url:
             alert_posts.append(url)
-            return httpx.Response(200, json={"channel_id": "alert-thread"}, request=httpx.Request("POST", url))
+            return httpx.Response(200, json={"id": "alert-thread"}, request=httpx.Request("POST", url))
         return httpx.Response(503, text="Upstream down", request=httpx.Request("POST", url))
 
     _mock_async_client(monkeypatch, fake_all_fail)
@@ -336,7 +342,7 @@ def test_webhook_email_muninn_fallback_and_fail_loud_503(
     data_503 = resp_503.json()
     assert data_503["dispatch_status"] == "failed"
     assert data_503["error_detail"].startswith("jev_router_unavailable:")
-    assert len(alert_posts) == 1
+    assert alert_posts == ["https://discord.com/api/v10/channels/chan-alert-456/threads"]
 
     failed_row = db_session.scalar(
         select(InboundEmail).where(InboundEmail.message_id == "<both-down@example.com>")

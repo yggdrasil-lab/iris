@@ -71,7 +71,8 @@ class DiscordAlertRequest(BaseModel):
     bot_name: Optional[str] = None
     avatar_url: Optional[str] = None
     user_id: Optional[str] = None
-    webhook_url: Optional[str] = None
+    channel_id: Optional[str] = None
+    destination_channel: Optional[str] = None
     cooldown_seconds: Optional[int] = None
     node: Optional[str] = None
     triage: Optional[bool] = None
@@ -92,7 +93,8 @@ class NotificationRequest(BaseModel):
     bot_name: Optional[str] = None
     avatar_url: Optional[str] = None
     user_id: Optional[str] = None
-    webhook_url: Optional[str] = None
+    channel_id: Optional[str] = None
+    destination_channel: Optional[str] = None
     cooldown_seconds: Optional[int] = None
     node: Optional[str] = None
     triage: Optional[bool] = None

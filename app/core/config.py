@@ -22,9 +22,12 @@ class Settings(BaseSettings):
     # Auth and inbound gateway secrets
     IRIS_WEBHOOK_SECRET: Optional[str] = None
 
-    # Discord notifications
-    DISCORD_ALERTS_WEBHOOK_URL: Optional[str] = None
-    DISCORD_DECISIONS_WEBHOOK_URL: Optional[str] = None
+    # Discord Bot REST API v10 notifications
+    DISCORD_BOT_TOKEN: Optional[str] = None
+    DISCORD_CHANNEL_ALERT_ID: Optional[str] = None
+    DISCORD_CHANNEL_INFO_ID: Optional[str] = None
+    DISCORD_CHANNEL_HEALTH_ID: Optional[str] = None
+    DISCORD_CHANNEL_WEALTH_ID: Optional[str] = None
     DISCORD_USER_ID: Optional[str] = None
     DISCORD_DEFAULT_COOLDOWN_SECONDS: int = 1800
 
@@ -62,8 +65,11 @@ class Settings(BaseSettings):
             "DATABASE_URL",
             "IRIS_DB_PASSWORD",
             "IRIS_WEBHOOK_SECRET",
-            "DISCORD_ALERTS_WEBHOOK_URL",
-            "DISCORD_DECISIONS_WEBHOOK_URL",
+            "DISCORD_BOT_TOKEN",
+            "DISCORD_CHANNEL_ALERT_ID",
+            "DISCORD_CHANNEL_INFO_ID",
+            "DISCORD_CHANNEL_HEALTH_ID",
+            "DISCORD_CHANNEL_WEALTH_ID",
             "TYPESAFE_API_KEY",
             "MUNINN_API_KEY",
             "PLUTUS_WEBHOOK_SECRET",
