@@ -45,10 +45,10 @@ services:
       - "com.docker.compose.project=${STACK_NAME}"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
-      interval: 30s
+      interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 5s
     deploy:
       mode: replicated
       replicas: 1
