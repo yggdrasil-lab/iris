@@ -31,11 +31,10 @@ class Settings(BaseSettings):
     DISCORD_USER_ID: Optional[str] = None
     DISCORD_DEFAULT_COOLDOWN_SECONDS: int = 1800
 
-    # TypeSafe Jev Decision Triage & Email Router configuration
-    TYPESAFE_API_KEY: Optional[str] = None
-    TYPESAFE_ENDPOINT: str = "https://api.typesafe.ai/v1/systemone"
-    MUNINN_API_BASE: Optional[str] = "http://muninn:4000/v1"
+    # Centralized Muninn Jev Decision Triage & Email Router configuration
+    MUNINN_API_BASE: str = "http://muninn:4000/v1"
     MUNINN_API_KEY: Optional[str] = None
+    MUNINN_JEV_MODEL: str = "jev-decision"
     IRIS_ALERT_TRIAGE_ENABLED: bool = False
     IRIS_ALERT_SCORE_THRESHOLD: int = 7
     IRIS_ALERT_CONFIDENCE_THRESHOLD: float = 0.80
@@ -70,7 +69,6 @@ class Settings(BaseSettings):
             "DISCORD_CHANNEL_INFO_ID",
             "DISCORD_CHANNEL_HEALTH_ID",
             "DISCORD_CHANNEL_WEALTH_ID",
-            "TYPESAFE_API_KEY",
             "MUNINN_API_KEY",
             "PLUTUS_WEBHOOK_SECRET",
         ):

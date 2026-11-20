@@ -13,6 +13,7 @@ jobs:
       IMAGE_TAG: iris
       IRIS_DB_MOUNT_PATH: /opt/iris/data
       MUNINN_API_BASE: http://muninn:4000/v1
+      MUNINN_JEV_MODEL: jev-decision
       KANBAN_GATEWAY_URL: http://huginn-gateway:8643
       IRIS_KANBAN_AUTO_TRIAGE: "true"
       IRIS_KANBAN_MIN_SCORE: "8"
@@ -30,7 +31,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           MUNINN_MASTER_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           IRIS_DB_PASSWORD: ${{ secrets.IRIS_DB_PASSWORD }}
           IRIS_WEBHOOK_SECRET: ${{ secrets.IRIS_WEBHOOK_SECRET }}
@@ -52,7 +52,6 @@ jobs:
           [ -z "$AWS_ACCESS_KEY_ID" ] && MISSING="$MISSING AWS_ACCESS_KEY_ID"
           [ -z "$AWS_SECRET_ACCESS_KEY" ] && MISSING="$MISSING AWS_SECRET_ACCESS_KEY"
           [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
-          [ -z "$TYPESAFE_API_KEY" ] && MISSING="$MISSING TYPESAFE_API_KEY"
           [ -z "$MUNINN_MASTER_KEY" ] && MISSING="$MISSING MUNINN_MASTER_KEY"
           [ -z "$IRIS_DB_PASSWORD" ] && MISSING="$MISSING IRIS_DB_PASSWORD"
           [ -z "$IRIS_WEBHOOK_SECRET" ] && MISSING="$MISSING IRIS_WEBHOOK_SECRET"
@@ -112,7 +111,6 @@ jobs:
           DISCORD_CHANNEL_HEALTH_ID: ${{ vars.DISCORD_CHANNEL_HEALTH_ID }}
           DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
           DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
-          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           MUNINN_API_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           IRIS_ALERT_TRIAGE_ENABLED: ${{ vars.IRIS_ALERT_TRIAGE_ENABLED }}
           PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}

@@ -18,63 +18,66 @@ VALID_ROUTE_TARGETS: set[str] = {
 
 
 class JevRouterUnavailableError(RuntimeError):
-    """Raised when both TypeSafe System One and Muninn email routing providers fail."""
+    """Raised when the Muninn Jev decision router fails or is unconfigured."""
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in ("true", "1", "yes"):
+            return True
+        if cleaned in ("false", "0", "no"):
+            return False
+    return False
+
+
+def _parse_clamped_score(value: Any, default: int = 5) -> int:
+    if value is None:
+        return default
+    try:
+        numeric = float(str(value).strip())
+        return max(1, min(10, int(round(numeric))))
+    except (TypeError, ValueError):
+        return default
 
 
 class TriageService:
-    """TypeSafe Jev decision triage and inbound email routing service.
+    """Centralized Muninn Jev decision triage and inbound email routing service.
 
-    Implements System One decision primitives:
-    1. Score (1-10): Operational urgency or financial significance scoring
-    2. Noul (boolean): Binary classification (noise suppression or actionable amount)
-    3. Choice: Destination channel or consumer route target selection
+    Routes all System One primitives (Score, Noul, Choice) through Muninn's
+    `jev-decision` model (`MUNINN_API_BASE` + `MUNINN_API_KEY`).
     """
 
     def __init__(
         self,
-        endpoint: Optional[str] = None,
-        api_key: Optional[str] = None,
         muninn_base: Optional[str] = None,
         muninn_api_key: Optional[str] = None,
+        muninn_jev_model: Optional[str] = None,
         score_threshold: Optional[int] = None,
         confidence_threshold: Optional[float] = None,
     ):
         self._overrides: Dict[str, Any] = {}
-        if endpoint is not None:
-            self._overrides["endpoint"] = endpoint
-        if api_key is not None:
-            self._overrides["api_key"] = api_key
         if muninn_base is not None:
             self._overrides["muninn_base"] = muninn_base
         if muninn_api_key is not None:
             self._overrides["muninn_api_key"] = muninn_api_key
+        if muninn_jev_model is not None:
+            self._overrides["muninn_jev_model"] = muninn_jev_model
         if score_threshold is not None:
             self._overrides["score_threshold"] = score_threshold
         if confidence_threshold is not None:
             self._overrides["confidence_threshold"] = confidence_threshold
 
     @property
-    def endpoint(self) -> str:
-        return self._overrides.get("endpoint", settings.TYPESAFE_ENDPOINT)
-
-    @endpoint.setter
-    def endpoint(self, value: str) -> None:
-        self._overrides["endpoint"] = value
-
-    @property
-    def api_key(self) -> Optional[str]:
-        return self._overrides["api_key"] if "api_key" in self._overrides else settings.TYPESAFE_API_KEY
-
-    @api_key.setter
-    def api_key(self, value: Optional[str]) -> None:
-        self._overrides["api_key"] = value
-
-    @property
-    def muninn_base(self) -> Optional[str]:
+    def muninn_base(self) -> str:
         return self._overrides["muninn_base"] if "muninn_base" in self._overrides else settings.MUNINN_API_BASE
 
     @muninn_base.setter
-    def muninn_base(self, value: Optional[str]) -> None:
+    def muninn_base(self, value: str) -> None:
         self._overrides["muninn_base"] = value
 
     @property
@@ -84,6 +87,18 @@ class TriageService:
     @muninn_api_key.setter
     def muninn_api_key(self, value: Optional[str]) -> None:
         self._overrides["muninn_api_key"] = value
+
+    @property
+    def muninn_jev_model(self) -> str:
+        return (
+            self._overrides["muninn_jev_model"]
+            if "muninn_jev_model" in self._overrides
+            else settings.MUNINN_JEV_MODEL
+        )
+
+    @muninn_jev_model.setter
+    def muninn_jev_model(self, value: str) -> None:
+        self._overrides["muninn_jev_model"] = value
 
     @property
     def score_threshold(self) -> int:
@@ -101,6 +116,60 @@ class TriageService:
     def confidence_threshold(self, value: float) -> None:
         self._overrides["confidence_threshold"] = value
 
+    async def _call_muninn_jev(
+        self,
+        state_text: str,
+        questions: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Invoke Muninn `jev-decision` via OpenAI-compatible chat completions."""
+        base = (self.muninn_base or "").strip()
+        api_key = (self.muninn_api_key or "").strip()
+        if not base or not api_key:
+            raise JevRouterUnavailableError(
+                "Muninn Jev router unconfigured: MUNINN_API_BASE and MUNINN_API_KEY are required"
+            )
+
+        schema_json = json.dumps({"questions": questions, "include_meta": True})
+        system_prompt = (
+            "Evaluate the state against the following Jev System One decision schema:\n"
+            f"```json\n{schema_json}\n```"
+        )
+        payload = {
+            "model": (self.muninn_jev_model or "jev-decision").strip(),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": state_text},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Yggdrasil-Iris/1.0",
+        }
+
+        url = f"{base.rstrip('/')}/chat/completions"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            raise JevRouterUnavailableError(f"Muninn Jev call failed: {exc}") from exc
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise ValueError("Assistant message content is not a string")
+            parsed = json.loads(content)
+        except Exception as exc:
+            raise JevRouterUnavailableError(f"Invalid Muninn Jev JSON response: {exc}") from exc
+
+        if not isinstance(parsed, dict):
+            raise JevRouterUnavailableError("Muninn Jev response payload must be a JSON object")
+        return parsed
+
     async def evaluate_alert(
         self,
         service: str,
@@ -109,11 +178,7 @@ class TriageService:
         severity: str = "error",
         node: Optional[str] = None,
     ) -> TriageResult:
-        """Evaluates an operational alert against Jev decision primitives.
-
-        Guarantees fail-open semantics: if TypeSafe API or network fails,
-        returns an unsuppressed actionable alert to ensure no critical incident is lost.
-        """
+        """Evaluate an operational alert via Muninn jev-decision with fail-open safety."""
         state_text = (
             f"Service: {service}\n"
             f"Node: {node or 'yggdrasil-cluster'}\n"
@@ -121,85 +186,6 @@ class TriageService:
             f"Alert Title: {title}\n"
             f"Details:\n{details}"
         )
-
-        if self.api_key:
-            try:
-                return await self._call_typesafe_systemone(state_text)
-            except Exception as e:
-                logger.warning(
-                    "TypeSafe Jev evaluation failed (%s). Falling back to Muninn/fail-open policy.",
-                    e,
-                )
-
-        if self.muninn_base:
-            try:
-                return await self._call_muninn_shim(state_text, severity)
-            except Exception as e:
-                logger.warning(
-                    "Muninn triage evaluation failed (%s). Falling back to fail-open policy.",
-                    e,
-                )
-
-        return self._fail_open_fallback(severity, reason="Decision engine unreachable; fail-open default applied")
-
-    async def route_inbound_email(
-        self,
-        from_address: str,
-        to_address: str,
-        subject: str,
-        received_at: datetime | str,
-        raw_excerpt: str,
-        attachments_meta: List[Dict[str, Any]],
-    ) -> EmailRouteVerdict:
-        """Classify and route an inbound email using TypeSafe Jev or Muninn fallback.
-
-        Strictly fail-loud: raises JevRouterUnavailableError if all providers fail
-        or are unconfigured. Never fails open for inbound emails.
-        """
-        received_str = received_at.isoformat() if isinstance(received_at, datetime) else str(received_at)
-        if attachments_meta:
-            attachment_lines = [
-                f"- {att.get('filename', 'unnamed')} ({att.get('content_type', 'application/octet-stream')}, {att.get('size_bytes', 0)} bytes)"
-                for att in attachments_meta
-            ]
-            attachments_summary = "\n".join(attachment_lines)
-        else:
-            attachments_summary = "None"
-
-        state_text = (
-            f"From: {from_address}\n"
-            f"To: {to_address}\n"
-            f"Received At: {received_str}\n"
-            f"Subject: {subject}\n"
-            f"Attachments:\n{attachments_summary}\n\n"
-            f"Body Excerpt:\n{raw_excerpt}"
-        )
-
-        errors: List[str] = []
-
-        if self.api_key:
-            try:
-                return await self._call_typesafe_email_router(state_text)
-            except Exception as exc:
-                logger.warning("TypeSafe email routing failed (%s). Trying Muninn fallback.", exc)
-                errors.append(f"typesafe: {exc}")
-        else:
-            errors.append("typesafe: unconfigured")
-
-        if self.muninn_base and self.muninn_base.strip():
-            try:
-                return await self._call_muninn_email_router(state_text)
-            except Exception as exc:
-                logger.error("Muninn email routing fallback failed (%s).", exc)
-                errors.append(f"muninn: {exc}")
-        else:
-            errors.append("muninn: unconfigured")
-
-        raise JevRouterUnavailableError(
-            f"Inbound email routing unavailable ({'; '.join(errors)})"
-        )
-
-    async def _call_typesafe_systemone(self, state_text: str) -> TriageResult:
         questions = {
             "urgency_score": {
                 "type": "score",
@@ -228,43 +214,33 @@ class TriageService:
             },
         }
 
-        payload = {
-            "model": "jev-latest",
-            "state": state_text,
-            "questions": questions,
-        }
+        try:
+            parsed = await self._call_muninn_jev(state_text, questions)
+        except JevRouterUnavailableError as exc:
+            logger.warning("Muninn Jev alert triage failed (%s). Applying fail-open fallback.", exc)
+            return self._fail_open_fallback(
+                severity,
+                reason=f"Decision engine unreachable ({exc}); fail-open default applied",
+            )
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "Iris-Triage-Service/1.0",
-        }
-
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(self.endpoint, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        answers = data.get("answers", {})
-
-        score_data = answers.get("urgency_score", {})
-        raw_score = float(score_data.get("score", 1.5))
-        scaled_score = max(1, min(10, int(round(1 + (raw_score / 3.0) * 9))))
-        score_conf = float(score_data.get("confidence", 0.8))
-
-        noul_data = answers.get("is_transient_noise", {})
-        noul_prob = float(noul_data.get("noul", 0.0))
-        is_transient = noul_prob >= 0.5
-        noul_conf = float(noul_data.get("confidence") or (abs(noul_prob - 0.5) * 2))
-
-        choice_data = answers.get("destination_channel", {})
-        choice = choice_data.get("choice", "alerts")
+        scaled_score = _parse_clamped_score(parsed.get("urgency_score"), default=7)
+        is_transient = _parse_bool(parsed.get("is_transient_noise", False))
+        choice = str(parsed.get("destination_channel", "alerts")).strip().lower()
         if choice not in ("alerts", "decisions", "metrics"):
             choice = "alerts"
-        choice_conf = float(choice_data.get("confidence", 0.8))
 
-        raw_conf = data.get("confidence")
-        overall_confidence = float(raw_conf) if raw_conf is not None else min(score_conf, noul_conf, choice_conf)
+        raw_conf = parsed.get("_confidence")
+        if raw_conf is None:
+            logger.warning(
+                "Muninn jev-decision alert response missing _confidence (odin jev-shim include_meta update required); "
+                "defaulting confidence to 0.0 for fail-open escalation."
+            )
+            overall_confidence = 0.0
+        else:
+            try:
+                overall_confidence = max(0.0, min(1.0, float(raw_conf)))
+            except (TypeError, ValueError):
+                overall_confidence = 0.0
 
         if overall_confidence >= self.confidence_threshold:
             if scaled_score < self.score_threshold or is_transient:
@@ -287,7 +263,7 @@ class TriageService:
             )
 
         logger.info(
-            "Jev triage evaluated: score=%d/10, transient=%s, route=%s, conf=%.2f, suppress=%s",
+            "Muninn Jev alert triage: score=%d/10, transient=%s, route=%s, conf=%.2f, suppress=%s",
             scaled_score,
             is_transient,
             choice,
@@ -299,13 +275,44 @@ class TriageService:
             urgency_score=scaled_score,
             confidence=overall_confidence,
             is_transient_noise=is_transient,
-            destination_channel=choice,
+            destination_channel=choice,  # type: ignore[arg-type]
             suppress=suppress,
             reason=reason,
-            provider="typesafe-jev",
+            provider="muninn-jev",
         )
 
-    async def _call_typesafe_email_router(self, state_text: str) -> EmailRouteVerdict:
+    async def route_inbound_email(
+        self,
+        from_address: str,
+        to_address: str,
+        subject: str,
+        received_at: datetime | str,
+        raw_excerpt: str,
+        attachments_meta: List[Dict[str, Any]],
+    ) -> EmailRouteVerdict:
+        """Classify and route an inbound email strictly via Muninn jev-decision.
+
+        Fail-loud: raises JevRouterUnavailableError if Muninn is unconfigured,
+        unreachable, returns non-200, or returns invalid JSON/route_target.
+        """
+        received_str = received_at.isoformat() if isinstance(received_at, datetime) else str(received_at)
+        if attachments_meta:
+            attachment_lines = [
+                f"- {att.get('filename', 'unnamed')} ({att.get('content_type', 'application/octet-stream')}, {att.get('size_bytes', 0)} bytes)"
+                for att in attachments_meta
+            ]
+            attachments_summary = "\n".join(attachment_lines)
+        else:
+            attachments_summary = "None"
+
+        state_text = (
+            f"From: {from_address}\n"
+            f"To: {to_address}\n"
+            f"Received At: {received_str}\n"
+            f"Subject: {subject}\n"
+            f"Attachments:\n{attachments_summary}\n\n"
+            f"Body Excerpt:\n{raw_excerpt}"
+        )
         questions = {
             "route_target": {
                 "type": "choice",
@@ -335,174 +342,47 @@ class TriageService:
             },
         }
 
-        payload = {
-            "model": "jev-latest",
-            "state": state_text,
-            "questions": questions,
-        }
+        parsed = await self._call_muninn_jev(state_text, questions)
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "Iris-Triage-Service/1.0",
-        }
+        route_target = parsed.get("route_target")
+        if not isinstance(route_target, str) or route_target not in VALID_ROUTE_TARGETS:
+            raise JevRouterUnavailableError(
+                f"Invalid or missing route_target from Muninn Jev: {route_target!r}"
+            )
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(self.endpoint, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+        has_actionable_amount = _parse_bool(parsed.get("has_actionable_amount", False))
+        scaled_score = _parse_clamped_score(parsed.get("significance_score"), default=5)
 
-        answers = data.get("answers", {})
-        if not isinstance(answers, dict):
-            raise ValueError("Missing answers dictionary in TypeSafe response")
-
-        choice_data = answers.get("route_target", {})
-        route_target = choice_data.get("choice")
-        if route_target not in VALID_ROUTE_TARGETS:
-            raise ValueError(f"Invalid route_target from TypeSafe: {route_target!r}")
-        choice_conf = float(choice_data.get("confidence", 0.8))
-
-        noul_data = answers.get("has_actionable_amount", {})
-        noul_prob = float(noul_data.get("noul", 0.0))
-        has_actionable_amount = noul_prob >= 0.5
-        noul_conf = float(noul_data.get("confidence") or (abs(noul_prob - 0.5) * 2))
-
-        score_data = answers.get("significance_score", {})
-        raw_score = float(score_data.get("score", 1.5))
-        scaled_score = max(1, min(10, int(round(1 + (raw_score / 3.0) * 9))))
-        score_conf = float(score_data.get("confidence", 0.8))
-
-        raw_conf = data.get("confidence")
-        overall_confidence = float(raw_conf) if raw_conf is not None else min(choice_conf, noul_conf, score_conf)
-        overall_confidence = max(0.0, min(1.0, overall_confidence))
+        raw_conf = parsed.get("_confidence")
+        if raw_conf is None:
+            logger.warning(
+                "Muninn jev-decision email response missing _confidence (odin jev-shim include_meta update is needed); "
+                "setting confidence=0.0 so email parks safely as needs_review."
+            )
+            overall_confidence = 0.0
+        else:
+            try:
+                overall_confidence = max(0.0, min(1.0, float(raw_conf)))
+            except (TypeError, ValueError):
+                overall_confidence = 0.0
 
         reason = (
             f"Jev classified as {route_target} "
             f"(amount={has_actionable_amount}, score={scaled_score}/10, conf={overall_confidence:.2f})"
         )
 
+        typed_target: RouteTargetType = route_target  # type: ignore[assignment]
         return EmailRouteVerdict(
-            route_target=route_target,
+            route_target=typed_target,
             has_actionable_amount=has_actionable_amount,
             confidence=overall_confidence,
             urgency_score=scaled_score,
             reason=reason,
-            provider="typesafe-jev",
-        )
-
-    async def _call_muninn_shim(self, state_text: str, severity: str) -> TriageResult:
-        """Secondary triage route through Muninn LiteLLM router."""
-        prompt = (
-            f"{state_text}\n\n"
-            "Rate the operational urgency on a scale of 1-10. Output only the integer score."
-        )
-        payload = {
-            "model": "agent-monitor",
-            "messages": [
-                {"role": "system", "content": "You are an operational alert triage scorer. Output only an integer 1-10."},
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": 10,
-            "temperature": 0.0,
-        }
-
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-            "User-Agent": "Iris-Triage-Service/1.0",
-        }
-        if self.muninn_api_key:
-            headers["Authorization"] = f"Bearer {self.muninn_api_key}"
-
-        url = f"{self.muninn_base.rstrip('/')}/chat/completions"
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        content = data["choices"][0]["message"]["content"].strip()
-        try:
-            score = max(1, min(10, int("".join(filter(str.isdigit, content)) or "5")))
-        except Exception:
-            score = 7
-
-        confidence = 0.85
-        suppress = (score < self.score_threshold) and (severity != "error")
-        reason = f"Muninn triage: score {score}/10 (threshold: {self.score_threshold})"
-
-        return TriageResult(
-            urgency_score=score,
-            confidence=confidence,
-            is_transient_noise=(score < self.score_threshold),
-            destination_channel="alerts" if score >= self.score_threshold else "metrics",
-            suppress=suppress,
-            reason=reason,
-            provider="muninn-shim",
-        )
-
-    async def _call_muninn_email_router(self, state_text: str) -> EmailRouteVerdict:
-        """Fallback inbound email classifier routed via Muninn LiteLLM."""
-        system_prompt = (
-            "You classify inbound homelab emails into JSON. "
-            "Valid route_target values: "
-            "plutus_dbs_alert, plutus_purchase_receipt, plutus_bank_statement, actionable_notice, ignore. "
-            "Return strict JSON with keys: "
-            "route_target (string), has_actionable_amount (boolean), confidence (float 0..1), "
-            "urgency_score (int 1..10), reason (short string)."
-        )
-        payload = {
-            "model": "agent-monitor",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": state_text},
-            ],
-            "max_tokens": 250,
-            "temperature": 0.0,
-        }
-
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-            "User-Agent": "Iris-Triage-Service/1.0",
-        }
-        if self.muninn_api_key:
-            headers["Authorization"] = f"Bearer {self.muninn_api_key}"
-
-        url = f"{self.muninn_base.rstrip('/')}/chat/completions"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        raw_content = data["choices"][0]["message"]["content"].strip()
-        cleaned = raw_content
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
-
-        parsed = json.loads(cleaned)
-        route_target: RouteTargetType = parsed["route_target"]
-        if route_target not in VALID_ROUTE_TARGETS:
-            raise ValueError(f"Invalid route_target from Muninn: {route_target!r}")
-
-        confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.75))))
-        urgency_score = max(1, min(10, int(parsed.get("urgency_score", 5))))
-        has_actionable_amount = bool(parsed.get("has_actionable_amount", False))
-        reason = str(parsed.get("reason") or f"Muninn classified as {route_target}")
-
-        return EmailRouteVerdict(
-            route_target=route_target,
-            has_actionable_amount=has_actionable_amount,
-            confidence=confidence,
-            urgency_score=urgency_score,
-            reason=reason,
-            provider="muninn-shim",
+            provider="muninn-jev",
         )
 
     def _fail_open_fallback(self, severity: str, reason: str) -> TriageResult:
-        """Deterministic fail-open fallback when external decision engines are unreachable."""
+        """Deterministic fail-open fallback when Muninn Jev is unreachable for alerts."""
         if severity == "error":
             score = 8
             suppress = False
