@@ -1,6 +1,7 @@
 """Tests for POST /webhook/email ingestion, Muninn jev-decision routing, and latent bug fixes."""
 
 import base64
+from datetime import datetime, timezone
 import json
 from typing import Any, Optional
 from unittest.mock import AsyncMock
@@ -12,7 +13,12 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.models import InboundEmail, InboundEmailAttachment
-from app.services.inbound_email_service import sanitize_html_to_text
+from app.services.inbound_email_service import (
+    MAX_STORED_BODY_CHARS,
+    build_raw_excerpt,
+    clean_html_for_storage,
+    sanitize_html_to_text,
+)
 
 
 def _make_muninn_jev_response(
@@ -477,3 +483,210 @@ def test_sanitize_html_to_text_strips_scripts_and_styles() -> None:
     assert "display:none" not in cleaned
     assert "Receipt" in cleaned
     assert "Total: $19.99" in cleaned
+
+
+def test_build_raw_excerpt_and_sanitize_html_strip_invisible_and_tracking() -> None:
+    preheader = ("\u034f\u200c\u2007\u00ad\u200b\ufeff\xa0" * 300) + "\n"
+    text_body = (
+        f"{preheader}"
+        "View in browser <https://track.example.com/click?token=abc123def456>\n"
+        "https://redirect.example.com/r/1234567890123456789012345678901234567890\n"
+        "Order Total:   SGD 179.74\n\n"
+        "Merchant:   Example Store\n"
+        "Short link: https://example.com/ok"
+    )
+    excerpt = build_raw_excerpt(text_body, None)
+    assert "\u034f" not in excerpt
+    assert "\u200c" not in excerpt
+    assert "\u2007" not in excerpt
+    assert "\u00ad" not in excerpt
+    assert "track.example.com" not in excerpt
+    assert "redirect.example.com" not in excerpt
+    assert "Order Total: SGD 179.74\nMerchant: Example Store" in excerpt
+    assert "https://example.com/ok" in excerpt
+
+    # If text_body becomes empty after stripping preheaders and tracking URLs, fall back to HTML
+    empty_after_strip = (
+        "\u034f\u200c\u2007\u00ad\n"
+        "<https://track.example.com/only-tracking-link>\n"
+        "https://redirect.example.com/r/1234567890123456789012345678901234567890"
+    )
+    fallback_html = (
+        "<html><body><p>&#847;&zwnj;\u034f\u200c</p>"
+        "<p>Item Total: $49.90</p>"
+        "<p>https://click.example.com/t/1234567890123456789012345678901234567890</p>"
+        "</body></html>"
+    )
+    fallback_excerpt = build_raw_excerpt(empty_after_strip, fallback_html)
+    assert fallback_excerpt == "Item Total: $49.90"
+
+
+def test_clean_html_for_storage_shrinks_bloated_receipt_and_preserves_metadata(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    css_bloat = ".cls { color: #333; padding: 10px; }\n" * 600
+    long_href = "https://track.example.com/gp/r.html?C=1234567890&K=ABCDEFGHIJKLMNOPQRSTUVWX&U=order123"
+    long_src = "https://cdn.example.com/images/pixel/123456789012345678901234567890123456789012345.png"
+    assert len(long_href) > 80
+    assert len(long_src) > 80
+
+    row_html = (
+        '<tr style="background-color:#ffffff;font-family:Arial,sans-serif;padding:12px;">'
+        f'<td style="width:100px;"><img style="border:0;" src="{long_src}" alt="Ergonomic Wireless Keyboard"></td>'
+        f'<td style="padding:8px;"><a style="text-decoration:none;" href="{long_href}">Keyboard Order</a></td>'
+        '<td style="text-align:right;"><span style="font-weight:bold;" aria-label="SGD 179.74">SGD 179.74</span></td>'
+        "</tr>\n"
+    )
+    bloated_html = (
+        "<!DOCTYPE html><html>"
+        f"<head><title>Receipt</title><style>{css_bloat}</style></head>"
+        "<body>"
+        "<!-- internal tracking metadata comment -->"
+        "<script>window.track = true;</script>"
+        "<div>&#847;&zwnj;\u034f\u200c\u2007\u00ad&nbsp;</div>"
+        '<a href="https://shop.example.com/orders/1">Order 1</a>'
+        f"<table>{row_html * 220}</table>"
+        "</body></html>"
+    )
+    assert len(bloated_html) > MAX_STORED_BODY_CHARS
+
+    cleaned = clean_html_for_storage(bloated_html)
+    assert cleaned is not None
+    assert len(cleaned) < MAX_STORED_BODY_CHARS
+    assert "<style" not in cleaned.lower()
+    assert "<script" not in cleaned.lower()
+    assert "<head" not in cleaned.lower()
+    assert "internal tracking metadata comment" not in cleaned
+    assert 'style="' not in cleaned.lower()
+    assert "track.example.com" not in cleaned
+    assert "cdn.example.com" not in cleaned
+    assert "\u034f" not in cleaned
+    assert "\u200c" not in cleaned
+    assert "&#847;" not in cleaned
+    assert "&zwnj;" not in cleaned
+    assert 'aria-label="SGD 179.74"' in cleaned
+    assert 'alt="Ergonomic Wireless Keyboard"' in cleaned
+    assert 'href="https://shop.example.com/orders/1"' in cleaned
+    assert "Keyboard Order" in cleaned
+
+    # Verify ingest_email persists cleaned html_excerpt
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
+    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", False)
+
+    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
+        return httpx.Response(
+            200,
+            json=_make_muninn_jev_response("plutus_purchase_receipt", has_amount="true", confidence=0.95),
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_post)
+    resp = client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<bloated-receipt@example.com>",
+            "from_address": "orders@shop.example.com",
+            "to_address": "iris@example.com",
+            "subject": "Your example order",
+            "html_body": bloated_html,
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert resp.status_code == 200
+    saved = db_session.scalar(
+        select(InboundEmail).where(InboundEmail.message_id == "<bloated-receipt@example.com>")
+    )
+    assert saved is not None
+    assert saved.html_excerpt is not None
+    assert len(saved.html_excerpt) < MAX_STORED_BODY_CHARS
+    assert 'aria-label="SGD 179.74"' in saved.html_excerpt
+    assert 'alt="Ergonomic Wireless Keyboard"' in saved.html_excerpt
+
+
+def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_90s_timeout(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
+    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
+    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
+
+    stale_row = InboundEmail(
+        message_id="<stale-captured-1@example.com>",
+        from_address="orders@shop.example.com",
+        to_address="iris@example.com",
+        subject="Your Order Confirmation",
+        received_at=datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc),
+        text_body="\u034f\u200c\u2007\u00ad\n<https://track.example.com/preheader-only>\n",
+        html_excerpt="<html><style>.x{display:none}</style><body><p>Order Confirmed: SGD 179.74 at Example Mart</p></body></html>",
+        raw_excerpt="\u034f\u200c starved preheader",
+        attachments_meta=[],
+        jev_verdict={
+            "route_target": "ignore",
+            "has_actionable_amount": False,
+            "confidence": 0.91,
+            "urgency_score": 1,
+            "reason": "stale",
+            "provider": "muninn-jev",
+        },
+        route_target="ignore",
+        dispatch_status="ignored",
+    )
+    db_session.add(stale_row)
+    db_session.commit()
+    db_session.refresh(stale_row)
+
+    recorded_calls: list[tuple[str, Any, Any]] = []
+
+    class CapturingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
+            recorded_calls.append((url, self.timeout, json))
+            if "muninn.local" in url:
+                return httpx.Response(
+                    200,
+                    json=_make_muninn_jev_response("plutus_purchase_receipt", has_amount="true", confidence=0.96),
+                    request=httpx.Request("POST", url),
+                )
+            return httpx.Response(
+                200,
+                json={"consumer_ref": "plutus-rcpt-42"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", CapturingAsyncClient)
+
+    retry_resp = client.post(
+        f"/api/emails/{stale_row.id}/retry",
+        json={"reclassify": True},
+    )
+    assert retry_resp.status_code == 200
+    data = retry_resp.json()
+    assert data["route_target"] == "plutus_purchase_receipt"
+    assert data["dispatch_status"] == "dispatched"
+    assert data["consumer_ref"] == "plutus-rcpt-42"
+    assert "Order Confirmed: SGD 179.74 at Example Mart" in data["raw_excerpt"]
+    assert "\u034f" not in data["raw_excerpt"]
+
+    assert len(recorded_calls) == 2
+    muninn_url, muninn_timeout, muninn_body = recorded_calls[0]
+    assert muninn_url == "http://muninn.local/v1/chat/completions"
+    assert muninn_timeout == 10.0
+    user_prompt = muninn_body["messages"][1]["content"]
+    assert "Order Confirmed: SGD 179.74 at Example Mart" in user_prompt
+    assert "starved preheader" not in user_prompt
+
+    plutus_url, plutus_timeout, plutus_body = recorded_calls[1]
+    assert plutus_url == "http://plutus-api:8000/integrations/email"
+    assert plutus_timeout == 90.0
+    assert "Order Confirmed: SGD 179.74 at Example Mart" in plutus_body["raw_excerpt"]

@@ -317,8 +317,14 @@ class TriageService:
             "route_target": {
                 "type": "choice",
                 "criteria": {
-                    "plutus_dbs_alert": "DBS Bank transaction alert, card charge, PayNow, FAST transfer, or GIRO notification",
-                    "plutus_purchase_receipt": "Order confirmation, tax invoice, or purchase receipt containing an itemized or total spend",
+                    "plutus_dbs_alert": (
+                        "DBS Bank transaction alert (including iBanking Alerts, digibank Alert, or emails from ibanking.alert@dbs.com), "
+                        "card charge, PayNow, FAST transfer, bill payment, or GIRO notification"
+                    ),
+                    "plutus_purchase_receipt": (
+                        "E-commerce order confirmation (e.g., Amazon), tax invoice, or forwarded purchase receipt "
+                        "containing an itemized or total spend"
+                    ),
                     "plutus_bank_statement": "Bank or credit card statement notification or attached statement PDF/CSV",
                     "actionable_notice": "Important non-bank notice such as rego/WOF reminder, utility bill notice, medical result, travel booking, or renewal requiring action",
                     "ignore": "Shipping tracking update without purchase total, marketing promo, newsletter, OTP login code, or low-value noise",
@@ -327,7 +333,8 @@ class TriageService:
             "has_actionable_amount": {
                 "type": "noul",
                 "instructions": (
-                    "True if a concrete monetary purchase or financial transaction amount with currency or dollar figure is present; "
+                    "True if a concrete monetary purchase or financial transaction amount with currency or dollar figure is present "
+                    "(including compact currency strings such as SGD2000.00, $179.74, or AUD amounts); "
                     "False if no concrete monetary transaction amount is present."
                 ),
             },

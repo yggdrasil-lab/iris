@@ -18,7 +18,7 @@ jobs:
       IRIS_KANBAN_AUTO_TRIAGE: "true"
       IRIS_KANBAN_MIN_SCORE: "8"
       PLUTUS_API_URL: http://plutus-api:8000
-      IRIS_PLUTUS_DISPATCH_ENABLED: "false"
+      IRIS_PLUTUS_DISPATCH_ENABLED: "true"
 
     steps:
       - name: Checkout code
