@@ -67,8 +67,8 @@ export const EmailListRow: React.FC<EmailListRowProps> = ({ email, onSelect }) =
           )}
 
           {Boolean(email.consumer_ref) && (
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 truncate max-w-[200px]">
-              Ref: {email.consumer_ref}
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 max-w-[200px] min-w-0">
+              <span className="truncate">Ref: {email.consumer_ref}</span>
             </span>
           )}
 
