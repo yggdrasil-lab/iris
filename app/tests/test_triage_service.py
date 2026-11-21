@@ -213,3 +213,215 @@ async def test_muninn_jev_email_routing_prompt_criteria_and_compact_currency(mon
     assert "SGD2000.00" in system_content
     assert "$179.74" in system_content
     assert "AUD" in system_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_confidence"),
+    [
+        # 1. High route_target + has_actionable_amount, low significance_score & _confidence -> 0.98
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": "true",
+                "significance_score": "7",
+                "_confidence": 0.68,
+                "_question_confidence": {
+                    "route_target": 1.0,
+                    "has_actionable_amount": 0.98,
+                    "significance_score": 0.63,
+                },
+            },
+            0.98,
+        ),
+        # 2. Low route_target with high significance_score -> uses low route_target (0.72)
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": "true",
+                "significance_score": "9",
+                "_confidence": 0.72,
+                "_question_confidence": {
+                    "route_target": 0.72,
+                    "has_actionable_amount": 0.96,
+                    "significance_score": 0.95,
+                },
+            },
+            0.72,
+        ),
+        # 3. Low has_actionable_amount with high significance_score -> uses low has_actionable_amount (0.65)
+        (
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": "false",
+                "significance_score": "8",
+                "_confidence": 0.65,
+                "_question_confidence": {
+                    "route_target": 0.96,
+                    "has_actionable_amount": 0.65,
+                    "significance_score": 0.95,
+                },
+            },
+            0.65,
+        ),
+    ],
+)
+async def test_muninn_jev_email_routing_uses_routing_question_confidences(
+    monkeypatch, payload: dict[str, Any], expected_confidence: float
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    async def fake_ok(url: str, body: dict[str, Any], headers: dict[str, str]):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(payload)}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_ok)
+    verdict = await TriageService().route_inbound_email(
+        from_address="alerts@example.com",
+        to_address="iris@example.com",
+        subject="Inbound alert",
+        received_at="2026-11-20T08:00:00Z",
+        raw_excerpt="Amount: SGD2000.00",
+        attachments_meta=[],
+    )
+    assert verdict.confidence == pytest.approx(expected_confidence)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_confidence"),
+    [
+        # 1. Absent _question_confidence -> falls back cleanly to _confidence
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.88,
+            },
+            0.88,
+        ),
+        # 2. Non-dict _question_confidence -> falls back to _confidence
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.83,
+                "_question_confidence": ["unexpected"],
+            },
+            0.83,
+        ),
+        # 3. Partial _question_confidence (missing has_actionable_amount) -> falls back to _confidence
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.77,
+                "_question_confidence": {"route_target": 0.99},
+            },
+            0.77,
+        ),
+        # 4. Partial _question_confidence (None value) -> falls back to _confidence
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.74,
+                "_question_confidence": {"route_target": 0.99, "has_actionable_amount": None},
+            },
+            0.74,
+        ),
+        # 5. Missing both _question_confidence and _confidence -> defaults to 0.0
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+            },
+            0.0,
+        ),
+        # 6. Non-numeric routing confidence -> 0.0
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.90,
+                "_question_confidence": {"route_target": "not-a-number", "has_actionable_amount": 0.95},
+            },
+            0.0,
+        ),
+        # 7. Non-finite (inf / -inf / nan) routing confidences -> 0.0
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.90,
+                "_question_confidence": {"route_target": float("inf"), "has_actionable_amount": 0.95},
+            },
+            0.0,
+        ),
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.90,
+                "_question_confidence": {"route_target": "-inf", "has_actionable_amount": "nan"},
+            },
+            0.0,
+        ),
+        # 8. Zero and out-of-range finite routing confidences clamp cleanly to [0.0, 1.0]
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.90,
+                "_question_confidence": {"route_target": 0.0, "has_actionable_amount": 0.95},
+            },
+            0.0,
+        ),
+        (
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.50,
+                "_question_confidence": {"route_target": 1.4, "has_actionable_amount": "0.91"},
+            },
+            0.91,
+        ),
+    ],
+)
+async def test_muninn_jev_email_routing_confidence_fallbacks_and_edge_cases(
+    monkeypatch, payload: dict[str, Any], expected_confidence: float
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    async def fake_ok(url: str, body: dict[str, Any], headers: dict[str, str]):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(payload)}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_ok)
+    verdict = await TriageService().route_inbound_email(
+        from_address="sender@example.com",
+        to_address="iris@example.com",
+        subject="Subject",
+        received_at="2026-11-20T08:00:00Z",
+        raw_excerpt="Body",
+        attachments_meta=[],
+    )
+    assert verdict.confidence == pytest.approx(expected_confidence)
