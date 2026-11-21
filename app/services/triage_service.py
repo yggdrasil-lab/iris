@@ -1,6 +1,7 @@
 from datetime import datetime
 import json
 import logging
+import math
 from typing import Any, Dict, List, Optional
 import httpx
 from app.core.config import settings
@@ -43,6 +44,19 @@ def _parse_clamped_score(value: Any, default: int = 5) -> int:
         return max(1, min(10, int(round(numeric))))
     except (TypeError, ValueError):
         return default
+
+
+def _parse_clamped_confidence(value: Any) -> float:
+    """Parse a numeric confidence value and clamp it to [0.0, 1.0]."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(numeric):
+        return 0.0
+    return max(0.0, min(1.0, numeric))
 
 
 class TriageService:
@@ -360,18 +374,26 @@ class TriageService:
         has_actionable_amount = _parse_bool(parsed.get("has_actionable_amount", False))
         scaled_score = _parse_clamped_score(parsed.get("significance_score"), default=5)
 
-        raw_conf = parsed.get("_confidence")
-        if raw_conf is None:
-            logger.warning(
-                "Muninn jev-decision email response missing _confidence (odin jev-shim include_meta update is needed); "
-                "setting confidence=0.0 so email parks safely as needs_review."
+        question_conf = parsed.get("_question_confidence")
+        if (
+            isinstance(question_conf, dict)
+            and question_conf.get("route_target") is not None
+            and question_conf.get("has_actionable_amount") is not None
+        ):
+            overall_confidence = min(
+                _parse_clamped_confidence(question_conf["route_target"]),
+                _parse_clamped_confidence(question_conf["has_actionable_amount"]),
             )
-            overall_confidence = 0.0
         else:
-            try:
-                overall_confidence = max(0.0, min(1.0, float(raw_conf)))
-            except (TypeError, ValueError):
+            raw_conf = parsed.get("_confidence")
+            if raw_conf is None:
+                logger.warning(
+                    "Muninn jev-decision email response missing _confidence (odin jev-shim include_meta update is needed); "
+                    "setting confidence=0.0 so email parks safely as needs_review."
+                )
                 overall_confidence = 0.0
+            else:
+                overall_confidence = _parse_clamped_confidence(raw_conf)
 
         reason = (
             f"Jev classified as {route_target} "
