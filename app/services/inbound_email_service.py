@@ -31,7 +31,7 @@ from app.services.triage_service import (
 logger = logging.getLogger("iris.inbound")
 
 MAX_STORED_BODY_CHARS = 65536
-MAX_RAW_EXCERPT_CHARS = 1500
+MAX_RAW_EXCERPT_CHARS = 4000
 PLUTUS_ROUTE_TARGETS = {
     "plutus_dbs_alert",
     "plutus_purchase_receipt",
@@ -411,7 +411,7 @@ async def _dispatch_to_plutus(email_row: InboundEmail) -> Tuple[int, str, Option
     target_url = f"{plutus_url.rstrip('/')}/integrations/email"
 
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(target_url, json=payload, headers=headers)
     except httpx.HTTPError as exc:
         return 503, "failed", f"plutus_network_error: {exc}"

@@ -68,11 +68,16 @@ _INBOUND_EMAIL_QUESTIONS: Dict[str, Any] = {
                 "card charge, PayNow, FAST transfer, bill payment, or GIRO notification"
             ),
             "plutus_purchase_receipt": (
-                "E-commerce order confirmation (e.g., Amazon), tax invoice, or forwarded purchase receipt "
-                "containing an itemized or total spend"
+                "E-commerce order confirmation (e.g., Amazon), tax invoice, flight itinerary or airline e-ticket receipt, "
+                "hotel or travel booking payment confirmation or deposit receipt, or forwarded purchase receipt "
+                "(containing an itemized or total spend, or emails with attached invoice/receipt PDFs or images such as TaxInvoice.pdf or SI_*.jpg)"
             ),
             "plutus_bank_statement": "Bank or credit card statement notification or attached statement PDF/CSV",
-            "actionable_notice": "Important non-bank notice such as rego/WOF reminder, utility bill notice, medical result, travel booking, or renewal requiring action",
+            "actionable_notice": (
+                "Important non-bank notice requiring action without a paid purchase receipt or invoice, "
+                "such as rego/WOF reminder, unpaid utility bill notice, medical result, "
+                "flight schedule change or check-in reminder, or renewal"
+            ),
             "ignore": "Shipping tracking update without purchase total, marketing promo, newsletter, OTP login code, or low-value noise",
         },
     },
@@ -80,8 +85,10 @@ _INBOUND_EMAIL_QUESTIONS: Dict[str, Any] = {
         "type": "noul",
         "instructions": (
             "True if a concrete monetary purchase or financial transaction amount with currency or dollar figure is present "
-            "(including compact currency strings such as SGD2000.00, $179.74, or AUD amounts); "
-            "False if no concrete monetary transaction amount is present."
+            "(including compact currency strings such as SGD2000.00, $179.74, or AUD amounts), "
+            "or if a payment or booking confirmation carries an invoice/receipt PDF or image attachment "
+            "(e.g., TaxInvoice.pdf, SI_*.jpg) even if the exact monetary amount appears inside the attachment or later in a quoted thread; "
+            "False if no concrete monetary transaction amount or invoice/receipt attachment is present."
         ),
     },
     "significance_score": {
