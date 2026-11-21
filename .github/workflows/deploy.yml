@@ -14,9 +14,6 @@ jobs:
       IRIS_DB_MOUNT_PATH: /opt/iris/data
       MUNINN_API_BASE: http://muninn:4000/v1
       MUNINN_JEV_MODEL: jev-decision
-      KANBAN_GATEWAY_URL: http://huginn-gateway:8643
-      IRIS_KANBAN_AUTO_TRIAGE: "true"
-      IRIS_KANBAN_MIN_SCORE: "8"
       PLUTUS_API_URL: http://plutus-api:8000
       IRIS_PLUTUS_DISPATCH_ENABLED: "true"
 

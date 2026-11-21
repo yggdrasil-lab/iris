@@ -16,7 +16,6 @@ from app.routers import api_emails, webhook_email
 from app.services.email_service import EmailService
 from app.services.discord_service import DiscordService
 from app.services.triage_service import TriageService
-from app.services.kanban_service import KanbanService
 
 logger = logging.getLogger("iris")
 
@@ -28,7 +27,6 @@ app.include_router(api_emails.router)
 email_service = EmailService()
 discord_service = DiscordService()
 triage_service = TriageService()
-kanban_service = KanbanService()
 
 @app.post("/notify", status_code=status.HTTP_200_OK)
 async def send_notification(request: NotificationRequest):
@@ -89,7 +87,6 @@ async def send_discord_alert(request: DiscordAlertRequest):
         )
 
         triage_result = None
-        kanban_task_id = None
         # Only evaluate triage for active alerts; resolutions (info) bypass gating
         if should_triage and request.severity != "info":
             triage_result = await triage_service.evaluate_alert(
@@ -99,22 +96,10 @@ async def send_discord_alert(request: DiscordAlertRequest):
                 severity=request.severity,
                 node=request.node
             )
-            if triage_result and not triage_result.suppress:
-                kanban_res = await kanban_service.maybe_dispatch_alert(
-                    service=request.service,
-                    title=request.title,
-                    details=request.details,
-                    severity=request.severity,
-                    node=request.node,
-                    urgency_score=triage_result.urgency_score,
-                )
-                if kanban_res:
-                    kanban_task_id = kanban_res.get("task_id")
 
         return await discord_service.send_alert(
             request,
             triage_result=triage_result,
-            kanban_task_id=kanban_task_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -191,23 +176,10 @@ async def handle_alertmanager_webhook(payload: AlertmanagerWebhookPayload):
                     severity=mapped_severity,
                     node=node
                 )
-                kanban_task_id = None
-                if not triage_res.suppress:
-                    kanban_res = await kanban_service.maybe_dispatch_alert(
-                        service=service,
-                        title=summary,
-                        details=description,
-                        severity=mapped_severity,
-                        node=node,
-                        urgency_score=triage_res.urgency_score,
-                    )
-                    if kanban_res:
-                        kanban_task_id = kanban_res.get("task_id")
 
                 res = await discord_service.send_alert(
                     alert_req,
                     triage_result=triage_res,
-                    kanban_task_id=kanban_task_id,
                 )
                 if res.get("status") == "suppressed":
                     suppressed_count += 1
