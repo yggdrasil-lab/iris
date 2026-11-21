@@ -47,16 +47,105 @@ def _parse_clamped_score(value: Any, default: int = 5) -> int:
 
 
 def _parse_clamped_confidence(value: Any) -> float:
-    """Parse a numeric confidence value and clamp it to [0.0, 1.0]."""
+    """Parse a finite numeric confidence value and clamp it to [0.0, 1.0]."""
     if isinstance(value, bool):
         return 0.0
     try:
         numeric = float(value)
     except (TypeError, ValueError):
         return 0.0
-    if math.isnan(numeric):
+    if not math.isfinite(numeric):
         return 0.0
     return max(0.0, min(1.0, numeric))
+
+
+_INBOUND_EMAIL_QUESTIONS: Dict[str, Any] = {
+    "route_target": {
+        "type": "choice",
+        "criteria": {
+            "plutus_dbs_alert": (
+                "DBS Bank transaction alert (including iBanking Alerts, digibank Alert, or emails from ibanking.alert@dbs.com), "
+                "card charge, PayNow, FAST transfer, bill payment, or GIRO notification"
+            ),
+            "plutus_purchase_receipt": (
+                "E-commerce order confirmation (e.g., Amazon), tax invoice, or forwarded purchase receipt "
+                "containing an itemized or total spend"
+            ),
+            "plutus_bank_statement": "Bank or credit card statement notification or attached statement PDF/CSV",
+            "actionable_notice": "Important non-bank notice such as rego/WOF reminder, utility bill notice, medical result, travel booking, or renewal requiring action",
+            "ignore": "Shipping tracking update without purchase total, marketing promo, newsletter, OTP login code, or low-value noise",
+        },
+    },
+    "has_actionable_amount": {
+        "type": "noul",
+        "instructions": (
+            "True if a concrete monetary purchase or financial transaction amount with currency or dollar figure is present "
+            "(including compact currency strings such as SGD2000.00, $179.74, or AUD amounts); "
+            "False if no concrete monetary transaction amount is present."
+        ),
+    },
+    "significance_score": {
+        "type": "score",
+        "criteria": [
+            "Marketing promo, newsletter, OTP code, or shipping tracking noise with no financial or action relevance",
+            "Low-priority informational email without urgent financial or operator action",
+            "Valid bank alert, purchase receipt, or financial statement ready for ingestion",
+            "High-priority financial charge, large transfer, overdue bill, or urgent actionable notice",
+        ],
+    },
+}
+
+
+def _build_inbound_email_state_text(
+    from_address: str,
+    to_address: str,
+    subject: str,
+    received_at: datetime | str,
+    raw_excerpt: str,
+    attachments_meta: List[Dict[str, Any]],
+) -> str:
+    """Format inbound email headers, attachment metadata, and excerpt for Jev."""
+    received_str = received_at.isoformat() if isinstance(received_at, datetime) else str(received_at)
+    if attachments_meta:
+        attachment_lines = [
+            f"- {att.get('filename', 'unnamed')} ({att.get('content_type', 'application/octet-stream')}, {att.get('size_bytes', 0)} bytes)"
+            for att in attachments_meta
+        ]
+        attachments_summary = "\n".join(attachment_lines)
+    else:
+        attachments_summary = "None"
+
+    return (
+        f"From: {from_address}\n"
+        f"To: {to_address}\n"
+        f"Received At: {received_str}\n"
+        f"Subject: {subject}\n"
+        f"Attachments:\n{attachments_summary}\n\n"
+        f"Body Excerpt:\n{raw_excerpt}"
+    )
+
+
+def _resolve_inbound_routing_confidence(parsed: Dict[str, Any]) -> float:
+    """Derive inbound email routing confidence from Jev question confidences or _confidence."""
+    question_conf = parsed.get("_question_confidence")
+    if (
+        isinstance(question_conf, dict)
+        and question_conf.get("route_target") is not None
+        and question_conf.get("has_actionable_amount") is not None
+    ):
+        return min(
+            _parse_clamped_confidence(question_conf["route_target"]),
+            _parse_clamped_confidence(question_conf["has_actionable_amount"]),
+        )
+
+    raw_conf = parsed.get("_confidence")
+    if raw_conf is None:
+        logger.warning(
+            "Muninn jev-decision email response missing _confidence (odin jev-shim include_meta update is needed); "
+            "setting confidence=0.0 so email parks safely as needs_review."
+        )
+        return 0.0
+    return _parse_clamped_confidence(raw_conf)
 
 
 class TriageService:
@@ -304,66 +393,11 @@ class TriageService:
         raw_excerpt: str,
         attachments_meta: List[Dict[str, Any]],
     ) -> EmailRouteVerdict:
-        """Classify and route an inbound email strictly via Muninn jev-decision.
-
-        Fail-loud: raises JevRouterUnavailableError if Muninn is unconfigured,
-        unreachable, returns non-200, or returns invalid JSON/route_target.
-        """
-        received_str = received_at.isoformat() if isinstance(received_at, datetime) else str(received_at)
-        if attachments_meta:
-            attachment_lines = [
-                f"- {att.get('filename', 'unnamed')} ({att.get('content_type', 'application/octet-stream')}, {att.get('size_bytes', 0)} bytes)"
-                for att in attachments_meta
-            ]
-            attachments_summary = "\n".join(attachment_lines)
-        else:
-            attachments_summary = "None"
-
-        state_text = (
-            f"From: {from_address}\n"
-            f"To: {to_address}\n"
-            f"Received At: {received_str}\n"
-            f"Subject: {subject}\n"
-            f"Attachments:\n{attachments_summary}\n\n"
-            f"Body Excerpt:\n{raw_excerpt}"
+        """Classify and route an inbound email via Muninn jev-decision; fails loud on errors."""
+        state_text = _build_inbound_email_state_text(
+            from_address, to_address, subject, received_at, raw_excerpt, attachments_meta
         )
-        questions = {
-            "route_target": {
-                "type": "choice",
-                "criteria": {
-                    "plutus_dbs_alert": (
-                        "DBS Bank transaction alert (including iBanking Alerts, digibank Alert, or emails from ibanking.alert@dbs.com), "
-                        "card charge, PayNow, FAST transfer, bill payment, or GIRO notification"
-                    ),
-                    "plutus_purchase_receipt": (
-                        "E-commerce order confirmation (e.g., Amazon), tax invoice, or forwarded purchase receipt "
-                        "containing an itemized or total spend"
-                    ),
-                    "plutus_bank_statement": "Bank or credit card statement notification or attached statement PDF/CSV",
-                    "actionable_notice": "Important non-bank notice such as rego/WOF reminder, utility bill notice, medical result, travel booking, or renewal requiring action",
-                    "ignore": "Shipping tracking update without purchase total, marketing promo, newsletter, OTP login code, or low-value noise",
-                },
-            },
-            "has_actionable_amount": {
-                "type": "noul",
-                "instructions": (
-                    "True if a concrete monetary purchase or financial transaction amount with currency or dollar figure is present "
-                    "(including compact currency strings such as SGD2000.00, $179.74, or AUD amounts); "
-                    "False if no concrete monetary transaction amount is present."
-                ),
-            },
-            "significance_score": {
-                "type": "score",
-                "criteria": [
-                    "Marketing promo, newsletter, OTP code, or shipping tracking noise with no financial or action relevance",
-                    "Low-priority informational email without urgent financial or operator action",
-                    "Valid bank alert, purchase receipt, or financial statement ready for ingestion",
-                    "High-priority financial charge, large transfer, overdue bill, or urgent actionable notice",
-                ],
-            },
-        }
-
-        parsed = await self._call_muninn_jev(state_text, questions)
+        parsed = await self._call_muninn_jev(state_text, _INBOUND_EMAIL_QUESTIONS)
 
         route_target = parsed.get("route_target")
         if not isinstance(route_target, str) or route_target not in VALID_ROUTE_TARGETS:
@@ -373,28 +407,7 @@ class TriageService:
 
         has_actionable_amount = _parse_bool(parsed.get("has_actionable_amount", False))
         scaled_score = _parse_clamped_score(parsed.get("significance_score"), default=5)
-
-        question_conf = parsed.get("_question_confidence")
-        if (
-            isinstance(question_conf, dict)
-            and question_conf.get("route_target") is not None
-            and question_conf.get("has_actionable_amount") is not None
-        ):
-            overall_confidence = min(
-                _parse_clamped_confidence(question_conf["route_target"]),
-                _parse_clamped_confidence(question_conf["has_actionable_amount"]),
-            )
-        else:
-            raw_conf = parsed.get("_confidence")
-            if raw_conf is None:
-                logger.warning(
-                    "Muninn jev-decision email response missing _confidence (odin jev-shim include_meta update is needed); "
-                    "setting confidence=0.0 so email parks safely as needs_review."
-                )
-                overall_confidence = 0.0
-            else:
-                overall_confidence = _parse_clamped_confidence(raw_conf)
-
+        overall_confidence = _resolve_inbound_routing_confidence(parsed)
         reason = (
             f"Jev classified as {route_target} "
             f"(amount={has_actionable_amount}, score={scaled_score}/10, conf={overall_confidence:.2f})"
