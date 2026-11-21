@@ -1,11 +1,14 @@
 """Unit tests for DiscordService Bot REST API v10 integration."""
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from app.core.config import settings
+from app.main import app
 from app.models.schemas import DiscordAlertRequest, TriageResult
 from app.services.discord_service import DiscordService
 
@@ -293,3 +296,83 @@ async def test_discord_fails_loud_when_token_or_channel_missing(monkeypatch) -> 
                 severity="error",
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_discord_alert_embed_fields_and_response_keys_with_triage(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "bot-token-123")
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", "ch-alert")
+
+    captured_bodies: list[dict[str, Any]] = []
+
+    async def fake_post(url: str, body: dict[str, Any], headers: dict[str, str]):
+        captured_bodies.append(body)
+        return httpx.Response(201, json={"id": "thread-direct-1"}, request=httpx.Request("POST", url))
+
+    _mock_async_client(monkeypatch, fake_post)
+    svc = DiscordService()
+    triage = TriageResult(
+        urgency_score=9,
+        confidence=0.95,
+        is_transient_noise=False,
+        destination_channel="alerts",
+        suppress=False,
+        reason="Actionable error",
+        provider="muninn-jev",
+    )
+
+    res = await svc.send_alert(
+        DiscordAlertRequest(service="plutus", title="API Down", details="HTTP 503", severity="error"),
+        triage_result=triage,
+    )
+    assert set(res.keys()) == {"status", "channel_id", "thread_id", "incident_count", "triage"}
+    assert res["status"] == "delivered"
+    field_names = [f["name"] for f in captured_bodies[0]["message"]["embeds"][0]["fields"]]
+    assert field_names == ["Service", "Node", "Severity", "Jev Gating", "Details"]
+
+
+def test_alert_endpoints_route_directly_to_discord(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "IRIS_ALERT_TRIAGE_ENABLED", True)
+    triage = TriageResult(
+        urgency_score=8,
+        confidence=0.92,
+        is_transient_noise=False,
+        destination_channel="alerts",
+        suppress=False,
+        reason="Actionable alert",
+        provider="muninn-jev",
+    )
+    triage_mock = AsyncMock(return_value=triage)
+    discord_mock = AsyncMock(return_value={"status": "delivered", "thread_id": "t-direct"})
+    monkeypatch.setattr("app.main.triage_service.evaluate_alert", triage_mock)
+    monkeypatch.setattr("app.main.discord_service.send_alert", discord_mock)
+
+    with TestClient(app) as test_client:
+        resp_notify = test_client.post(
+            "/notify/discord",
+            json={"service": "plutus", "title": "Sync Error", "details": "Timeout", "severity": "error"},
+        )
+        assert resp_notify.status_code == 200
+        assert resp_notify.json()["status"] == "delivered"
+
+        resp_hook = test_client.post(
+            "/webhook/alertmanager",
+            json={
+                "status": "firing",
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": {"alertname": "HighLatency", "service": "plutus", "severity": "critical"},
+                        "annotations": {"summary": "Plutus latency", "description": "p99 > 2s"},
+                    }
+                ],
+            },
+        )
+        assert resp_hook.status_code == 200
+        assert resp_hook.json()["delivered"] == 1
+
+    assert triage_mock.await_count == 2
+    assert discord_mock.await_count == 2
+    for call in discord_mock.await_args_list:
+        assert list(call.kwargs.keys()) == ["triage_result"]
+        assert call.kwargs["triage_result"] == triage

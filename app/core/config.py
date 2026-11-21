@@ -44,11 +44,6 @@ class Settings(BaseSettings):
     PLUTUS_WEBHOOK_SECRET: Optional[str] = None
     IRIS_PLUTUS_DISPATCH_ENABLED: bool = False
 
-    # Autonomous Kanban Swarm Remediation Pipeline
-    KANBAN_GATEWAY_URL: Optional[str] = "http://huginn-gateway:8643"
-    IRIS_KANBAN_AUTO_TRIAGE: bool = True
-    IRIS_KANBAN_MIN_SCORE: int = 8
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
