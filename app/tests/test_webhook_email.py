@@ -8,13 +8,16 @@ from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 import httpx
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.models import InboundEmail, InboundEmailAttachment
 from app.services.inbound_email_service import (
+    MAX_RAW_EXCERPT_CHARS,
     MAX_STORED_BODY_CHARS,
+    _dispatch_to_plutus,
     build_raw_excerpt,
     clean_html_for_storage,
     sanitize_html_to_text,
@@ -521,6 +524,21 @@ def test_build_raw_excerpt_and_sanitize_html_strip_invisible_and_tracking() -> N
     assert fallback_excerpt == "Item Total: $49.90"
 
 
+def test_build_raw_excerpt_preserves_content_past_1500_chars_up_to_4000_chars() -> None:
+    assert MAX_RAW_EXCERPT_CHARS == 4000
+
+    lead_in = ("Booking notes and cancellation policy details. " * 50)[:1900].rstrip()
+    amount_marker = "\nDeposit Paid: PHP 11,700.00\n"
+    middle_pad = ("Terms and conditions line item. " * 80)[:2200].rstrip()
+    trailing_marker = "TRAILING_BEYOND_4000"
+    long_text = f"{lead_in}{amount_marker}{middle_pad}{trailing_marker}"
+
+    excerpt = build_raw_excerpt(long_text, None)
+    assert len(excerpt) == 4000
+    assert "Deposit Paid: PHP 11,700.00" in excerpt
+    assert trailing_marker not in excerpt
+
+
 def test_clean_html_for_storage_shrinks_bloated_receipt_and_preserves_metadata(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
@@ -604,7 +622,7 @@ def test_clean_html_for_storage_shrinks_bloated_receipt_and_preserves_metadata(
     assert 'alt="Ergonomic Wireless Keyboard"' in saved.html_excerpt
 
 
-def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_90s_timeout(
+def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_120s_timeout(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
     monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
@@ -688,5 +706,55 @@ def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_90s_timeo
 
     plutus_url, plutus_timeout, plutus_body = recorded_calls[1]
     assert plutus_url == "http://plutus-api:8000/integrations/email"
-    assert plutus_timeout == 90.0
+    assert plutus_timeout == 120.0
     assert "Order Confirmed: SGD 179.74 at Example Mart" in plutus_body["raw_excerpt"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_plutus_configures_120s_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
+    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
+
+    captured_timeouts: list[Any] = []
+
+    class CapturingAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured_timeouts.append(kwargs.get("timeout"))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
+            return httpx.Response(
+                200,
+                json={"consumer_ref": "plutus-rcpt-120"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", CapturingAsyncClient)
+
+    email_row = InboundEmail(
+        id=101,
+        message_id="<timeout-check@example.com>",
+        from_address="reservations@example-hotel.test",
+        to_address="iris@example.com",
+        subject="Hotel Deposit Receipt",
+        received_at=datetime(2026, 11, 21, 2, 0, tzinfo=timezone.utc),
+        text_body="Deposit Paid: PHP 11,700.00",
+        html_excerpt=None,
+        raw_excerpt="Deposit Paid: PHP 11,700.00",
+        attachments_meta=[],
+        jev_verdict={"route_target": "plutus_purchase_receipt"},
+        route_target="plutus_purchase_receipt",
+        dispatch_status="received",
+        attachments=[],
+    )
+
+    status_code, dispatch_status, consumer_ref = await _dispatch_to_plutus(email_row)
+    assert status_code == 200
+    assert dispatch_status == "dispatched"
+    assert consumer_ref == "plutus-rcpt-120"
+    assert captured_timeouts == [120.0]

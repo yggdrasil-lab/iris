@@ -7,7 +7,11 @@ import httpx
 import pytest
 
 from app.core.config import settings
-from app.services.triage_service import JevRouterUnavailableError, TriageService
+from app.services.triage_service import (
+    _INBOUND_EMAIL_QUESTIONS,
+    JevRouterUnavailableError,
+    TriageService,
+)
 
 
 def _mock_async_client(monkeypatch, handler) -> None:
@@ -213,6 +217,97 @@ async def test_muninn_jev_email_routing_prompt_criteria_and_compact_currency(mon
     assert "SGD2000.00" in system_content
     assert "$179.74" in system_content
     assert "AUD" in system_content
+
+
+def test_inbound_email_questions_cover_travel_receipts_and_attachment_amounts() -> None:
+    route_criteria = _INBOUND_EMAIL_QUESTIONS["route_target"]["criteria"]
+    receipt_criteria = route_criteria["plutus_purchase_receipt"]
+    notice_criteria = route_criteria["actionable_notice"]
+    amount_instructions = _INBOUND_EMAIL_QUESTIONS["has_actionable_amount"]["instructions"]
+
+    assert "flight itinerary" in receipt_criteria.lower()
+    assert "airline e-ticket" in receipt_criteria.lower()
+    assert "hotel" in receipt_criteria.lower()
+    assert "payment confirmation" in receipt_criteria.lower()
+    assert "deposit receipt" in receipt_criteria.lower()
+    assert "tax invoice" in receipt_criteria.lower()
+    assert "e-commerce order confirmation" in receipt_criteria.lower()
+    assert "forwarded purchase receipt" in receipt_criteria.lower()
+    assert "TaxInvoice.pdf" in receipt_criteria
+    assert "SI_*.jpg" in receipt_criteria
+
+    assert "travel booking" not in notice_criteria.lower()
+    assert "without a paid purchase receipt" in notice_criteria.lower()
+    assert "flight schedule change" in notice_criteria.lower()
+    assert "check-in reminder" in notice_criteria.lower()
+
+    assert "TaxInvoice.pdf" in amount_instructions
+    assert "SI_*.jpg" in amount_instructions
+    assert "attachment" in amount_instructions.lower()
+    assert "quoted thread" in amount_instructions.lower()
+
+
+@pytest.mark.asyncio
+async def test_muninn_jev_email_routing_includes_travel_receipt_and_attachment_criteria(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_ok(url: str, body: dict[str, Any], headers: dict[str, str]):
+        captured.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "route_target": "plutus_purchase_receipt",
+                                    "has_actionable_amount": True,
+                                    "significance_score": 7,
+                                    "_question_confidence": {
+                                        "route_target": 0.95,
+                                        "has_actionable_amount": 0.91,
+                                        "significance_score": 0.90,
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_ok)
+    verdict = await TriageService().route_inbound_email(
+        from_address="reservations@example-hotel.test",
+        to_address="iris@example.com",
+        subject="Hotel Reservation Deposit Confirmation",
+        received_at="2026-11-21T02:00:00Z",
+        raw_excerpt="Thank you for your deposit payment. See attached invoice image.",
+        attachments_meta=[
+            {
+                "filename": "SI_99881.jpg",
+                "content_type": "image/jpeg",
+                "size_bytes": 480000,
+            }
+        ],
+    )
+
+    assert verdict.route_target == "plutus_purchase_receipt"
+    assert verdict.has_actionable_amount is True
+    assert verdict.confidence == pytest.approx(0.91)
+
+    system_content = captured[0]["messages"][0]["content"]
+    user_content = captured[0]["messages"][1]["content"]
+    assert "TaxInvoice.pdf" in system_content
+    assert "SI_*.jpg" in system_content
+    assert "SI_99881.jpg" in user_content
 
 
 @pytest.mark.asyncio
