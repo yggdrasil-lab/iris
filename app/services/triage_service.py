@@ -12,6 +12,7 @@ logger = logging.getLogger("iris.triage")
 VALID_ROUTE_TARGETS: set[str] = {
     "plutus_dbs_alert",
     "plutus_purchase_receipt",
+    "plutus_payslip",
     "plutus_bank_statement",
     "actionable_notice",
     "ignore",
@@ -72,6 +73,11 @@ _INBOUND_EMAIL_QUESTIONS: Dict[str, Any] = {
                 "hotel or travel booking payment confirmation or deposit receipt, or forwarded purchase receipt "
                 "(containing an itemized or total spend, or emails with attached invoice/receipt PDFs or images such as TaxInvoice.pdf or SI_*.jpg)"
             ),
+            "plutus_payslip": (
+                "Employer payroll notification, salary advice, or forwarded payslip email "
+                "(e.g., 'Your Latest Payslip Is Attached' or an attached payslip.pdf / payroll document), "
+                "even when the email body contains zero dollar figures"
+            ),
             "plutus_bank_statement": "Bank or credit card statement notification or attached statement PDF/CSV",
             "actionable_notice": (
                 "Important non-bank notice requiring action without a paid purchase receipt or invoice, "
@@ -86,9 +92,11 @@ _INBOUND_EMAIL_QUESTIONS: Dict[str, Any] = {
         "instructions": (
             "True if a concrete monetary purchase or financial transaction amount with currency or dollar figure is present "
             "(including compact currency strings such as SGD2000.00, $179.74, or AUD amounts), "
-            "or if a payment or booking confirmation carries an invoice/receipt PDF or image attachment "
-            "(e.g., TaxInvoice.pdf, SI_*.jpg) even if the exact monetary amount appears inside the attachment or later in a quoted thread; "
-            "False if no concrete monetary transaction amount or invoice/receipt attachment is present."
+            "if a payment or booking confirmation carries an invoice/receipt PDF or image attachment "
+            "(e.g., TaxInvoice.pdf, SI_*.jpg) even if the exact monetary amount appears inside the attachment or later in a quoted thread, "
+            "or if a payroll/payslip notification carries an attached payslip PDF or image "
+            "(e.g., payslip.pdf) even when the net pay amount resides inside the PDF attachment; "
+            "False if no concrete monetary transaction amount or invoice/receipt/payslip attachment is present."
         ),
     },
     "significance_score": {
@@ -96,7 +104,7 @@ _INBOUND_EMAIL_QUESTIONS: Dict[str, Any] = {
         "criteria": [
             "Marketing promo, newsletter, OTP code, or shipping tracking noise with no financial or action relevance",
             "Low-priority informational email without urgent financial or operator action",
-            "Valid bank alert, purchase receipt, or financial statement ready for ingestion",
+            "Valid bank alert, purchase receipt, payslip, or financial statement ready for ingestion",
             "High-priority financial charge, large transfer, overdue bill, or urgent actionable notice",
         ],
     },

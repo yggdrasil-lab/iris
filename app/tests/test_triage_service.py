@@ -1,14 +1,16 @@
 """Unit tests for centralized Muninn jev-decision TriageService."""
 
 import json
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 import pytest
 
 from app.core.config import settings
+from app.models.schemas import RouteTargetType
 from app.services.triage_service import (
     _INBOUND_EMAIL_QUESTIONS,
+    VALID_ROUTE_TARGETS,
     JevRouterUnavailableError,
     TriageService,
 )
@@ -520,3 +522,93 @@ async def test_muninn_jev_email_routing_confidence_fallbacks_and_edge_cases(
         attachments_meta=[],
     )
     assert verdict.confidence == pytest.approx(expected_confidence)
+
+
+def test_inbound_email_questions_cover_payslip_routing_and_attachment_amounts() -> None:
+    assert "plutus_payslip" in set(get_args(RouteTargetType))
+    assert VALID_ROUTE_TARGETS == set(get_args(RouteTargetType))
+
+    route_criteria = _INBOUND_EMAIL_QUESTIONS["route_target"]["criteria"]
+    assert "plutus_payslip" in route_criteria
+    payslip_criteria = route_criteria["plutus_payslip"]
+    assert "payroll" in payslip_criteria.lower()
+    assert "salary" in payslip_criteria.lower()
+    assert "Your Latest Payslip Is Attached" in payslip_criteria
+    assert "payslip.pdf" in payslip_criteria
+    assert "zero dollar" in payslip_criteria.lower()
+
+    amount_instructions = _INBOUND_EMAIL_QUESTIONS["has_actionable_amount"]["instructions"]
+    assert "payslip" in amount_instructions.lower()
+    assert "payslip.pdf" in amount_instructions
+    assert "net pay" in amount_instructions.lower()
+
+    tier3_criteria = _INBOUND_EMAIL_QUESTIONS["significance_score"]["criteria"][2]
+    assert "payslip" in tier3_criteria.lower()
+
+
+@pytest.mark.asyncio
+async def test_muninn_jev_email_routing_classifies_forwarded_payslip_without_body_amounts(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-master-key")
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_ok(url: str, body: dict[str, Any], headers: dict[str, str]):
+        captured.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "route_target": "plutus_payslip",
+                                    "has_actionable_amount": True,
+                                    "significance_score": 8,
+                                    "_question_confidence": {
+                                        "route_target": 0.96,
+                                        "has_actionable_amount": 0.92,
+                                        "significance_score": 0.90,
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_ok)
+    verdict = await TriageService().route_inbound_email(
+        from_address="alex.tan@example.com",
+        to_address="iris@example.com",
+        subject="Fwd: Your Latest Payslip Is Attached",
+        received_at="2026-11-22T01:00:00Z",
+        raw_excerpt=(
+            "Forwarded message from Acme Payroll <payroll@acme.example>.\n"
+            "Hi Alex Tan, your latest payslip is attached as a PDF."
+        ),
+        attachments_meta=[
+            {
+                "filename": "payslip.pdf",
+                "content_type": "application/pdf",
+                "size_bytes": 20480,
+            }
+        ],
+    )
+
+    assert verdict.route_target == "plutus_payslip"
+    assert verdict.has_actionable_amount is True
+    assert verdict.confidence == pytest.approx(0.92)
+    assert verdict.urgency_score == 8
+
+    system_content = captured[0]["messages"][0]["content"]
+    user_content = captured[0]["messages"][1]["content"]
+    assert "plutus_payslip" in system_content
+    assert "Your Latest Payslip Is Attached" in system_content
+    assert "payslip.pdf" in user_content
+    assert "Acme Payroll" in user_content

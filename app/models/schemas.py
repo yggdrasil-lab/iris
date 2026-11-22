@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 RouteTargetType = Literal[
     "plutus_dbs_alert",
     "plutus_purchase_receipt",
+    "plutus_payslip",
     "plutus_bank_statement",
     "actionable_notice",
     "ignore",
