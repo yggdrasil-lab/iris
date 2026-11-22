@@ -1,6 +1,8 @@
 """Tests for Authentik-protected operator /api/emails endpoints."""
 
+import base64
 from datetime import datetime, timezone
+import json as json_codec
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -171,3 +173,144 @@ def test_api_emails_retry_reroute_and_ignore(
     ignore_resp = client.post(f"/api/emails/{first.id}/ignore")
     assert ignore_resp.status_code == 200
     assert ignore_resp.json()["dispatch_status"] == "ignored"
+
+
+def test_api_emails_payslip_reroute_and_reclassify_retry(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
+    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
+    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
+
+    encoded_pdf = base64.b64encode(b"%PDF-1.4\nAcme Payroll Payslip").decode("ascii")
+
+    portal_notice = InboundEmail(
+        message_id="<api-payslip-portal@acme.example>",
+        from_address="payroll@acme.example",
+        to_address="iris@example.com",
+        subject="Your latest payslip notification",
+        received_at=datetime(2026, 11, 22, 1, 0, tzinfo=timezone.utc),
+        raw_excerpt="Please review your Acme Payroll notice.",
+        attachments_meta=[],
+        route_target="actionable_notice",
+        dispatch_status="needs_review",
+    )
+    stranded_payslip = InboundEmail(
+        message_id="<api-payslip-stranded@acme.example>",
+        from_address="alex.tan@example.com",
+        to_address="iris@example.com",
+        subject="Fwd: Your Latest Payslip Is Attached",
+        received_at=datetime(2026, 11, 22, 1, 5, tzinfo=timezone.utc),
+        text_body="Hi Alex Tan, your Acme Payroll payslip is attached.",
+        raw_excerpt="Hi Alex Tan, your Acme Payroll payslip is attached.",
+        attachments_meta=[
+            {
+                "filename": "payslip.pdf",
+                "content_type": "application/pdf",
+                "size_bytes": 29,
+                "sha256": "b" * 64,
+            }
+        ],
+        jev_verdict={
+            "route_target": "actionable_notice",
+            "has_actionable_amount": False,
+            "confidence": 0.70,
+            "urgency_score": 5,
+            "reason": "Parked pre-calibration",
+            "provider": "muninn-jev",
+        },
+        route_target="actionable_notice",
+        dispatch_status="needs_review",
+        error_detail="low_confidence: 0.70 < 0.80",
+        attachments=[
+            InboundEmailAttachment(
+                filename="payslip.pdf",
+                content_type="application/pdf",
+                size_bytes=29,
+                sha256="b" * 64,
+                content_base64=encoded_pdf,
+            )
+        ],
+    )
+    db_session.add_all([portal_notice, stranded_payslip])
+    db_session.commit()
+    db_session.refresh(portal_notice)
+    db_session.refresh(stranded_payslip)
+
+    plutus_payloads: list[dict[str, Any]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
+            if "muninn.local" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json_codec.dumps(
+                                        {
+                                            "route_target": "plutus_payslip",
+                                            "has_actionable_amount": True,
+                                            "significance_score": 8,
+                                            "_confidence": 0.95,
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    },
+                    request=httpx.Request("POST", url),
+                )
+            plutus_payloads.append(json)
+            receipt_id = 88 if len(plutus_payloads) == 1 else 91
+            return httpx.Response(
+                200,
+                json={
+                    "status": "processed",
+                    "route_target": "plutus_payslip",
+                    "consumer_ref": f"receipt:{receipt_id}",
+                    "receipt_id": receipt_id,
+                    "receipt_ids": [receipt_id],
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    reroute_resp = client.post(
+        f"/api/emails/{portal_notice.id}/reroute",
+        json={"route_target": "plutus_payslip"},
+    )
+    assert reroute_resp.status_code == 200
+    reroute_data = reroute_resp.json()
+    assert reroute_data["route_target"] == "plutus_payslip"
+    assert reroute_data["dispatch_status"] == "dispatched"
+    assert reroute_data["consumer_ref"] == "receipt:88"
+    assert reroute_data["error_detail"] is None
+
+    reclassify_resp = client.post(
+        f"/api/emails/{stranded_payslip.id}/retry",
+        json={"reclassify": True},
+    )
+    assert reclassify_resp.status_code == 200
+    reclassify_data = reclassify_resp.json()
+    assert reclassify_data["route_target"] == "plutus_payslip"
+    assert reclassify_data["dispatch_status"] == "dispatched"
+    assert reclassify_data["consumer_ref"] == "receipt:91"
+    assert reclassify_data["error_detail"] is None
+    assert len(plutus_payloads) == 2
+    assert plutus_payloads[1]["route_target"] == "plutus_payslip"
+    assert plutus_payloads[1]["attachments"][0]["filename"] == "payslip.pdf"
+    assert plutus_payloads[1]["attachments"][0]["content_base64"] == encoded_pdf

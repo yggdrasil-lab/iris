@@ -1,4 +1,5 @@
 import base64
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -35,6 +36,7 @@ MAX_RAW_EXCERPT_CHARS = 4000
 PLUTUS_ROUTE_TARGETS = {
     "plutus_dbs_alert",
     "plutus_purchase_receipt",
+    "plutus_payslip",
     "plutus_bank_statement",
 }
 
@@ -436,6 +438,121 @@ async def _dispatch_to_plutus(email_row: InboundEmail) -> Tuple[int, str, Option
     return 503, "failed", f"plutus_upstream_{resp.status_code}: {resp.text[:500]}"
 
 
+@dataclass(frozen=True)
+class _ReviewGuardNotice:
+    error_detail: Optional[str]
+    title: str
+    details: str
+
+
+def _has_document_attachment(attachments_meta: Optional[List[Dict[str, Any]]]) -> bool:
+    """Return True when attachments metadata includes a PDF document or image file."""
+    if not attachments_meta:
+        return False
+    for att in attachments_meta:
+        if not isinstance(att, dict):
+            continue
+        raw_content_type = str(att.get("content_type") or "").strip().lower()
+        mime_type = raw_content_type.split(";", 1)[0].strip()
+        filename = str(att.get("filename") or "").strip().lower()
+        if mime_type == "application/pdf" or mime_type.startswith("image/") or filename.endswith(".pdf"):
+            return True
+    return False
+
+
+def _check_plutus_pre_dispatch_guard(
+    email_row: InboundEmail,
+    route_target: RouteTargetType,
+    has_actionable_amount: bool,
+) -> Optional[_ReviewGuardNotice]:
+    """Return review notice metadata when a Plutus email lacks required payload evidence."""
+    subject_label = email_row.subject or "(no subject)"
+    if route_target == "plutus_purchase_receipt" and not has_actionable_amount:
+        return _ReviewGuardNotice(
+            error_detail="receipt_missing_actionable_amount",
+            title=f"Receipt Needs Review: {subject_label}",
+            details=(
+                f"Email #{email_row.id} from {email_row.from_address} classified as plutus_purchase_receipt "
+                "without actionable monetary amount."
+            ),
+        )
+    if (
+        route_target == "plutus_payslip"
+        and not has_actionable_amount
+        and not _has_document_attachment(email_row.attachments_meta)
+    ):
+        return _ReviewGuardNotice(
+            error_detail="payslip_missing_attachment",
+            title=f"Payslip Needs Review: {subject_label}",
+            details=(
+                f"Email #{email_row.id} from {email_row.from_address} classified as plutus_payslip "
+                "without attached payslip PDF or image."
+            ),
+        )
+    return None
+
+
+async def _park_email_for_review(
+    db: Session,
+    email_row: InboundEmail,
+    discord_service: DiscordService,
+    notice: _ReviewGuardNotice,
+) -> int:
+    email_row.dispatch_status = "needs_review"
+    email_row.error_detail = notice.error_detail
+    db.commit()
+    db.refresh(email_row)
+    await _notify_discord_best_effort(
+        discord_service,
+        title=notice.title,
+        details=notice.details,
+        severity="warning",
+        channel="decisions",
+    )
+    return 200
+
+
+async def _dispatch_plutus_route(
+    db: Session,
+    email_row: InboundEmail,
+    route_target: RouteTargetType,
+    has_actionable_amount: bool,
+    manual_reroute: bool,
+    discord_service: DiscordService,
+) -> int:
+    if not manual_reroute:
+        guard = _check_plutus_pre_dispatch_guard(email_row, route_target, has_actionable_amount)
+        if guard is not None:
+            return await _park_email_for_review(db, email_row, discord_service, guard)
+
+    if not settings.IRIS_PLUTUS_DISPATCH_ENABLED:
+        email_row.dispatch_status = "needs_review"
+        email_row.error_detail = "plutus_dispatch_disabled_phase1_capture"
+        db.commit()
+        db.refresh(email_row)
+        return 200
+
+    status_code, new_status, detail = await _dispatch_to_plutus(email_row)
+    email_row.dispatch_status = new_status
+    if new_status == "dispatched":
+        email_row.consumer_ref = detail
+        email_row.error_detail = None
+    else:
+        email_row.error_detail = detail
+    db.commit()
+    db.refresh(email_row)
+
+    if new_status == "failed":
+        await _notify_discord_best_effort(
+            discord_service,
+            title=f"Plutus Dispatch Failed: Email #{email_row.id}",
+            details=f"Route: {route_target}\nError: {detail}",
+            severity="error",
+            channel="alerts",
+        )
+    return status_code
+
+
 async def _dispatch_routed_email(
     db: Session,
     email_row: InboundEmail,
@@ -455,63 +572,17 @@ async def _dispatch_routed_email(
         return 200
 
     if route_target == "actionable_notice":
-        email_row.dispatch_status = "needs_review"
-        email_row.error_detail = None
-        db.commit()
-        db.refresh(email_row)
-        await _notify_discord_best_effort(
-            discord_service,
+        notice = _ReviewGuardNotice(
+            error_detail=None,
             title=f"Actionable Notice: {email_row.subject or '(no subject)'}",
             details=f"Email #{email_row.id} from {email_row.from_address} marked actionable_notice.\n{email_row.raw_excerpt or ''}",
-            severity="warning",
-            channel="decisions",
         )
-        return 200
+        return await _park_email_for_review(db, email_row, discord_service, notice)
 
     if route_target in PLUTUS_ROUTE_TARGETS:
-        if route_target == "plutus_purchase_receipt" and not has_actionable_amount and not manual_reroute:
-            email_row.dispatch_status = "needs_review"
-            email_row.error_detail = "receipt_missing_actionable_amount"
-            db.commit()
-            db.refresh(email_row)
-            await _notify_discord_best_effort(
-                discord_service,
-                title=f"Receipt Needs Review: {email_row.subject or '(no subject)'}",
-                details=(
-                    f"Email #{email_row.id} from {email_row.from_address} classified as plutus_purchase_receipt "
-                    "without actionable monetary amount."
-                ),
-                severity="warning",
-                channel="decisions",
-            )
-            return 200
-
-        if not settings.IRIS_PLUTUS_DISPATCH_ENABLED:
-            email_row.dispatch_status = "needs_review"
-            email_row.error_detail = "plutus_dispatch_disabled_phase1_capture"
-            db.commit()
-            db.refresh(email_row)
-            return 200
-
-        status_code, new_status, detail = await _dispatch_to_plutus(email_row)
-        email_row.dispatch_status = new_status
-        if new_status == "dispatched":
-            email_row.consumer_ref = detail
-            email_row.error_detail = None
-        else:
-            email_row.error_detail = detail
-        db.commit()
-        db.refresh(email_row)
-
-        if new_status == "failed":
-            await _notify_discord_best_effort(
-                discord_service,
-                title=f"Plutus Dispatch Failed: Email #{email_row.id}",
-                details=f"Route: {route_target}\nError: {detail}",
-                severity="error",
-                channel="alerts",
-            )
-        return status_code
+        return await _dispatch_plutus_route(
+            db, email_row, route_target, has_actionable_amount, manual_reroute, discord_service
+        )
 
     email_row.dispatch_status = "needs_review"
     email_row.error_detail = f"unsupported_route_target: {route_target}"

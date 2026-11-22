@@ -758,3 +758,197 @@ async def test_dispatch_to_plutus_configures_120s_timeout(monkeypatch) -> None:
     assert dispatch_status == "dispatched"
     assert consumer_ref == "plutus-rcpt-120"
     assert captured_timeouts == [120.0]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "has_amount", "attachments"),
+    [
+        (
+            "pdf-with-amount",
+            True,
+            [{"filename": "payslip.pdf", "content_type": "application/pdf"}],
+        ),
+        (
+            "pdf-without-body-amount",
+            False,
+            [{"filename": "payslip.pdf", "content_type": "application/pdf"}],
+        ),
+        (
+            "pdf-extension-octet-stream",
+            False,
+            [{"filename": "Acme_Payslip.PDF", "content_type": "application/octet-stream"}],
+        ),
+        (
+            "image-payslip-without-body-amount",
+            False,
+            [{"filename": "payslip_page1.png", "content_type": "image/png; charset=binary"}],
+        ),
+        (
+            "text-amount-only",
+            True,
+            [],
+        ),
+    ],
+)
+def test_webhook_email_payslip_dispatches_to_plutus(
+    client: TestClient,
+    monkeypatch,
+    case_id: str,
+    has_amount: bool,
+    attachments: list[dict[str, str]],
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
+    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
+    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
+
+    plutus_requests: list[dict[str, Any]] = []
+
+    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
+        if "muninn.local" in url:
+            return httpx.Response(
+                200,
+                json=_make_muninn_jev_response(
+                    "plutus_payslip",
+                    has_amount=has_amount,
+                    score=8,
+                    confidence=0.95,
+                ),
+                request=httpx.Request("POST", url),
+            )
+        plutus_requests.append(json_body)
+        return httpx.Response(
+            200,
+            json={
+                "status": "processed",
+                "route_target": "plutus_payslip",
+                "consumer_ref": "receipt:42",
+                "receipt_id": 42,
+                "receipt_ids": [42],
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    _mock_async_client(monkeypatch, fake_post)
+
+    encoded_doc = base64.b64encode(b"%PDF-1.4\nAcme Payroll Net Pay Synthetic").decode("ascii")
+    payload_attachments = [
+        {
+            "filename": item["filename"],
+            "content_type": item["content_type"],
+            "content_base64": encoded_doc,
+        }
+        for item in attachments
+    ]
+
+    resp = client.post(
+        "/webhook/email",
+        json={
+            "message_id": f"<payslip-{case_id}@acme.example>",
+            "from_address": "alex.tan@example.com",
+            "to_address": "iris@example.com",
+            "subject": "Fwd: Your Latest Payslip Is Attached",
+            "text_body": "Hi Alex Tan, please find your latest payslip from Acme Payroll attached.",
+            "attachments": payload_attachments,
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["route_target"] == "plutus_payslip"
+    assert body["dispatch_status"] == "dispatched"
+    assert body["consumer_ref"] == "receipt:42"
+    assert body["error_detail"] is None
+
+    assert len(plutus_requests) == 1
+    dispatched = plutus_requests[0]
+    assert dispatched["route_target"] == "plutus_payslip"
+    assert len(dispatched["attachments"]) == len(payload_attachments)
+    if payload_attachments:
+        assert dispatched["attachments"][0]["filename"] == payload_attachments[0]["filename"]
+        assert dispatched["attachments"][0]["content_base64"] == encoded_doc
+
+
+def test_webhook_email_payslip_missing_attachment_parks_and_keeps_receipt_guard(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
+    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
+    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
+    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
+    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
+    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "discord-bot-token")
+    monkeypatch.setattr(settings, "DISCORD_CHANNEL_INFO_ID", "chan-info-123")
+
+    plutus_calls: list[str] = []
+    discord_calls: list[tuple[str, dict[str, Any]]] = []
+    current_target = {"route": "plutus_payslip"}
+
+    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
+        if "discord.com/api/v10" in url:
+            discord_calls.append((url, json_body))
+            return httpx.Response(200, json={"id": f"thread-{len(discord_calls)}"}, request=httpx.Request("POST", url))
+        if "muninn.local" in url:
+            return httpx.Response(
+                200,
+                json=_make_muninn_jev_response(
+                    current_target["route"],
+                    has_amount=False,
+                    score=7,
+                    confidence=0.91,
+                ),
+                request=httpx.Request("POST", url),
+            )
+        plutus_calls.append(url)
+        return httpx.Response(200, json={"consumer_ref": "unexpected"}, request=httpx.Request("POST", url))
+
+    _mock_async_client(monkeypatch, fake_post)
+
+    # 1. Attachment-less payslip portal reminder without amount -> payslip_missing_attachment
+    resp_payslip = client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<payslip-portal-only@acme.example>",
+            "from_address": "payroll@acme.example",
+            "to_address": "iris@example.com",
+            "subject": "Log in to view your payslip",
+            "text_body": "Hi Alex Tan, your payslip is ready on the HR portal.",
+            "attachments": [],
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert resp_payslip.status_code == 200
+    payslip_body = resp_payslip.json()
+    assert payslip_body["route_target"] == "plutus_payslip"
+    assert payslip_body["dispatch_status"] == "needs_review"
+    assert payslip_body["error_detail"] == "payslip_missing_attachment"
+    assert plutus_calls == []
+    assert len(discord_calls) == 1
+    assert discord_calls[0][0] == "https://discord.com/api/v10/channels/chan-info-123/threads"
+
+    # 2. Purchase receipt guard stays unchanged even when a PDF attachment is present
+    current_target["route"] = "plutus_purchase_receipt"
+    encoded_pdf = base64.b64encode(b"%PDF-1.4\nReceipt").decode("ascii")
+    resp_receipt = client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<receipt-no-amt-pdf@example.com>",
+            "from_address": "orders@merchant.example",
+            "to_address": "iris@example.com",
+            "subject": "Order document",
+            "text_body": "See attached order summary.",
+            "attachments": [
+                {
+                    "filename": "summary.pdf",
+                    "content_type": "application/pdf",
+                    "content_base64": encoded_pdf,
+                }
+            ],
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert resp_receipt.status_code == 200
+    assert resp_receipt.json()["dispatch_status"] == "needs_review"
+    assert resp_receipt.json()["error_detail"] == "receipt_missing_actionable_amount"
+    assert plutus_calls == []

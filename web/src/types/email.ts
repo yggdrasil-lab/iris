@@ -1,6 +1,7 @@
 export type RouteTargetType =
   | 'plutus_dbs_alert'
   | 'plutus_purchase_receipt'
+  | 'plutus_payslip'
   | 'plutus_bank_statement'
   | 'actionable_notice'
   | 'ignore';
@@ -82,6 +83,7 @@ export interface InboundEmailStatsResponse {
 export const ROUTE_TARGET_OPTIONS: Array<{ value: RouteTargetType; label: string }> = [
   { value: 'plutus_dbs_alert', label: 'DBS Alert' },
   { value: 'plutus_purchase_receipt', label: 'Purchase Receipt' },
+  { value: 'plutus_payslip', label: 'Payslip' },
   { value: 'plutus_bank_statement', label: 'Bank Statement' },
   { value: 'actionable_notice', label: 'Actionable Notice' },
   { value: 'ignore', label: 'Ignore' },
@@ -90,6 +92,7 @@ export const ROUTE_TARGET_OPTIONS: Array<{ value: RouteTargetType; label: string
 export const ROUTE_TARGET_LABELS: Record<string, string> = {
   plutus_dbs_alert: 'DBS Alert',
   plutus_purchase_receipt: 'Purchase Receipt',
+  plutus_payslip: 'Payslip',
   plutus_bank_statement: 'Bank Statement',
   actionable_notice: 'Actionable Notice',
   ignore: 'Ignore',
