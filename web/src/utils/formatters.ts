@@ -32,6 +32,7 @@ export function formatTimestamp(iso: string): string {
   const parsed = new Date(iso);
   if (Number.isNaN(parsed.getTime())) return iso;
   return new Intl.DateTimeFormat('en-NZ', {
+    timeZone: 'Pacific/Auckland',
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(parsed);
