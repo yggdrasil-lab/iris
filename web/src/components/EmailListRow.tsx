@@ -1,5 +1,5 @@
 import React from 'react';
-import { GlassCard, StatusBadge } from '@yggdrasil-lab/ui';
+import { AlertBanner, GlassCard, StatusBadge } from '@yggdrasil-lab/ui';
 import { AlertCircle, Paperclip, Sparkles } from 'lucide-react';
 import { ROUTE_TARGET_LABELS, type InboundEmailRead } from '../types/email';
 import { formatConfidence, formatTimestamp, getStatusPresentation } from '../utils/formatters';
@@ -9,16 +9,72 @@ export interface EmailListRowProps {
   onSelect: (id: number) => void;
 }
 
-export const EmailListRow: React.FC<EmailListRowProps> = ({ email, onSelect }) => {
-  const statusMeta = getStatusPresentation(email.dispatch_status);
+interface EmailListBadgesProps {
+  email: InboundEmailRead;
+}
+
+const EmailListBadges: React.FC<EmailListBadgesProps> = ({ email }) => {
   const routeLabel = ROUTE_TARGET_LABELS[email.route_target] || email.route_target;
   const attachmentCount = email.attachments_meta?.length || 0;
   const confidenceText = formatConfidence(email.jev_verdict?.confidence);
 
   return (
+    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+      <StatusBadge label={routeLabel} variant="info" size="xs" showDot={false} />
+
+      {email.jev_verdict !== null && (
+        <StatusBadge
+          label={`Conf ${confidenceText}`}
+          variant="idle"
+          size="xs"
+          showDot={false}
+          icon={<Sparkles className="w-3 h-3 text-amber-400" />}
+          className="tabular-nums"
+        />
+      )}
+
+      {attachmentCount > 0 && (
+        <StatusBadge
+          label={`${attachmentCount} ${attachmentCount === 1 ? 'file' : 'files'}`}
+          variant="idle"
+          size="xs"
+          showDot={false}
+          icon={<Paperclip className="w-3 h-3 text-slate-400" />}
+          className="tabular-nums"
+        />
+      )}
+
+      {Boolean(email.consumer_ref) && (
+        <StatusBadge
+          label={`Ref: ${email.consumer_ref}`}
+          variant="success"
+          size="xs"
+          showDot={false}
+          className="font-mono max-w-[200px]"
+        />
+      )}
+
+      {email.retry_count > 0 && (
+        <StatusBadge
+          label={`Retries: ${email.retry_count}`}
+          variant="idle"
+          size="xs"
+          showDot={false}
+          className="tabular-nums text-slate-400"
+        />
+      )}
+    </div>
+  );
+};
+
+export const EmailListRow: React.FC<EmailListRowProps> = ({ email, onSelect }) => {
+  const statusMeta = getStatusPresentation(email.dispatch_status);
+
+  return (
     <GlassCard
       hoverGlow
       onClick={() => onSelect(email.id)}
+      data-testid={`email-row-${email.id}`}
       className="p-4 sm:p-5 overflow-hidden hover:border-sky-500/40"
     >
       <div className="space-y-2.5 min-w-0">
@@ -45,39 +101,7 @@ export const EmailListRow: React.FC<EmailListRowProps> = ({ email, onSelect }) =
           />
         </div>
 
-        <div className="flex flex-wrap items-center gap-1.5 min-w-0">
-          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-sky-500/15 text-sky-300 border border-sky-500/30">
-            {routeLabel}
-          </span>
-
-          {email.jev_verdict !== null && (
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-slate-800/80 text-slate-300 border border-slate-700/60 tabular-nums">
-              <Sparkles className="w-3 h-3 text-amber-400 shrink-0" />
-              <span>Conf {confidenceText}</span>
-            </span>
-          )}
-
-          {attachmentCount > 0 && (
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-slate-800/80 text-slate-300 border border-slate-700/60 tabular-nums">
-              <Paperclip className="w-3 h-3 text-slate-400 shrink-0" />
-              <span>
-                {attachmentCount} {attachmentCount === 1 ? 'file' : 'files'}
-              </span>
-            </span>
-          )}
-
-          {Boolean(email.consumer_ref) && (
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 max-w-[200px] min-w-0">
-              <span className="truncate">Ref: {email.consumer_ref}</span>
-            </span>
-          )}
-
-          {email.retry_count > 0 && (
-            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-800/70 text-slate-400 border border-slate-700/50 tabular-nums">
-              Retries: {email.retry_count}
-            </span>
-          )}
-        </div>
+        <EmailListBadges email={email} />
 
         {Boolean(email.raw_excerpt) && (
           <p className="text-xs text-slate-400 leading-relaxed line-clamp-2 break-words m-0">
@@ -86,10 +110,13 @@ export const EmailListRow: React.FC<EmailListRowProps> = ({ email, onSelect }) =
         )}
 
         {Boolean(email.error_detail) && (
-          <div className="flex items-start gap-1.5 px-2.5 py-1.5 rounded-xl bg-rose-500/10 border border-rose-500/25 text-xs text-rose-300 min-w-0">
-            <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+          <AlertBanner
+            variant="error"
+            icon={<AlertCircle className="w-3.5 h-3.5 text-rose-400" />}
+            className="px-2.5 py-1.5"
+          >
             <span className="break-all line-clamp-2">{email.error_detail}</span>
-          </div>
+          </AlertBanner>
         )}
       </div>
     </GlassCard>

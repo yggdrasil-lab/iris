@@ -1,5 +1,5 @@
 import React from 'react';
-import { ChipSelector, SearchInput } from '@yggdrasil-lab/ui';
+import { ChipSelector, GlassCard, SearchInput, SelectInput } from '@yggdrasil-lab/ui';
 import { ROUTE_TARGET_OPTIONS } from '../types/email';
 
 export interface EmailFiltersBarProps {
@@ -19,6 +19,11 @@ const STATUS_CHIP_OPTIONS = [
   { value: 'ignored', label: 'Ignored' },
 ];
 
+const ROUTE_FILTER_OPTIONS = [
+  { value: 'all', label: 'All Routes' },
+  ...ROUTE_TARGET_OPTIONS,
+];
+
 export const EmailFiltersBar: React.FC<EmailFiltersBarProps> = ({
   searchQuery,
   onSearchChange,
@@ -28,7 +33,7 @@ export const EmailFiltersBar: React.FC<EmailFiltersBarProps> = ({
   onRouteTargetChange,
 }) => {
   return (
-    <div className="rounded-2xl bg-card/70 backdrop-blur-md border border-border/80 p-3.5 shadow-lg space-y-3">
+    <GlassCard padding="sm" className="space-y-3">
       <div className="flex flex-col sm:flex-row gap-2.5">
         <SearchInput
           value={searchQuery}
@@ -40,23 +45,15 @@ export const EmailFiltersBar: React.FC<EmailFiltersBarProps> = ({
         />
 
         <div className="sm:w-56 shrink-0">
-          <label htmlFor="route-target-filter" className="sr-only">
-            Filter by route target
-          </label>
-          <select
+          <SelectInput
             id="route-target-filter"
             data-testid="route-target-filter"
+            aria-label="Filter by route target"
+            variant="blue"
             value={routeTargetFilter}
             onChange={(e) => onRouteTargetChange(e.target.value)}
-            className="w-full min-h-[44px] px-3 py-2 bg-background border border-border rounded-xl text-base sm:text-xs text-slate-200 focus:outline-none focus:border-blue-500 transition-colors"
-          >
-            <option value="all">All Routes</option>
-            {ROUTE_TARGET_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
+            options={ROUTE_FILTER_OPTIONS}
+          />
         </div>
       </div>
 
@@ -68,6 +65,6 @@ export const EmailFiltersBar: React.FC<EmailFiltersBarProps> = ({
         size="sm"
         className="[&>button]:min-h-[44px] [&>button]:px-3.5"
       />
-    </div>
+    </GlassCard>
   );
 };

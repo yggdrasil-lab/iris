@@ -10,226 +10,226 @@ import {
   SessionExpiredBanner,
   SummaryMetricGrid,
   type SummaryMetricItem,
+  type ThemeVariant,
 } from '@yggdrasil-lab/ui';
 import { AlertTriangle, CheckCircle2, Clock, Inbox, Mail, RefreshCw } from 'lucide-react';
 import { EmailDetailModal } from './components/EmailDetailModal';
 import { EmailFiltersBar } from './components/EmailFiltersBar';
 import { EmailListRow } from './components/EmailListRow';
 import { useIrisEmails } from './hooks/useIrisEmails';
+import type { InboundEmailRead, InboundEmailStatsResponse } from './types/email';
+
+interface KpiTileSpec {
+  id: string;
+  filterValue: string;
+  label: string;
+  subvalue: string;
+  variant: ThemeVariant;
+  valueClassName?: string;
+  icon: React.ReactNode;
+  readCount: (stats: InboundEmailStatsResponse | null) => number;
+}
+
+const KPI_TILE_SPECS: KpiTileSpec[] = [
+  {
+    id: 'total',
+    filterValue: 'all',
+    label: 'Total Captured',
+    subvalue: 'All inbound mail',
+    variant: 'blue',
+    icon: <Inbox className="w-3 h-3 text-sky-400" />,
+    readCount: (stats) => stats?.total ?? 0,
+  },
+  {
+    id: 'needs_review',
+    filterValue: 'needs_review',
+    label: 'Needs Review',
+    subvalue: 'Operator queue',
+    variant: 'amber',
+    valueClassName: 'text-amber-400',
+    icon: <Clock className="w-3 h-3 text-amber-400" />,
+    readCount: (stats) => stats?.by_status?.needs_review ?? 0,
+  },
+  {
+    id: 'failed',
+    filterValue: 'failed',
+    label: 'Failed',
+    subvalue: 'Needs retry',
+    variant: 'amber',
+    valueClassName: 'text-rose-400',
+    icon: <AlertTriangle className="w-3 h-3 text-rose-400" />,
+    readCount: (stats) => stats?.by_status?.failed ?? 0,
+  },
+  {
+    id: 'dispatched',
+    filterValue: 'dispatched',
+    label: 'Dispatched',
+    subvalue: 'Delivered cleanly',
+    variant: 'emerald',
+    valueClassName: 'text-emerald-400',
+    icon: <CheckCircle2 className="w-3 h-3 text-emerald-400" />,
+    readCount: (stats) => stats?.by_status?.dispatched ?? 0,
+  },
+];
+
+function buildSummaryItems(
+  stats: InboundEmailStatsResponse | null,
+  statusFilter: string,
+  setStatusFilter: (status: string) => void,
+): SummaryMetricItem[] {
+  return KPI_TILE_SPECS.map((spec) => {
+    const isActive = statusFilter === spec.filterValue;
+    const nextFilter = spec.filterValue !== 'all' && isActive ? 'all' : spec.filterValue;
+
+    return {
+      id: spec.id,
+      label: spec.label,
+      icon: spec.icon,
+      value: spec.readCount(stats),
+      valueClassName: spec.valueClassName,
+      subvalue: spec.subvalue,
+      variant: spec.variant,
+      active: isActive,
+      ariaLabel: `Filter by ${spec.label}`,
+      testId: `kpi-tile-${spec.id}`,
+      onClick: () => setStatusFilter(nextFilter),
+    };
+  });
+}
+
+interface AuditFeedBodyProps {
+  isLoading: boolean;
+  emails: InboundEmailRead[];
+  hasActiveFilters: boolean;
+  onResetFilters: () => void;
+  onSelectEmail: (id: number) => void;
+}
+
+const AuditFeedBody: React.FC<AuditFeedBodyProps> = ({
+  isLoading,
+  emails,
+  hasActiveFilters,
+  onResetFilters,
+  onSelectEmail,
+}) => {
+  if (isLoading) {
+    return <LoadingState label="Loading inbound email ledger..." variant="blue" />;
+  }
+  if (emails.length === 0) {
+    return (
+      <EmptyState
+        icon={<Inbox className="w-8 h-8" />}
+        title="No matching inbound emails"
+        description="Adjust your status, route target, or search filters, or forward a message to Iris to populate the audit feed."
+        action={
+          hasActiveFilters ? (
+            <Button variant="secondary" size="sm" className="min-h-[44px]" onClick={onResetFilters}>
+              Clear Filters
+            </Button>
+          ) : undefined
+        }
+      />
+    );
+  }
+  return (
+    <div className="space-y-3 min-w-0">
+      {emails.map((email) => (
+        <EmailListRow key={email.id} email={email} onSelect={onSelectEmail} />
+      ))}
+    </div>
+  );
+};
+
+const AuditFeedErrorBanner: React.FC<{
+  error: string | null;
+  onRetry: () => void;
+}> = ({ error, onRetry }) => {
+  if (!error) return null;
+  return (
+    <AlertBanner
+      variant="error"
+      title="Unable to load audit feed"
+      action={
+        <Button
+          variant="secondary"
+          size="xs"
+          icon={<RefreshCw className="w-3 h-3" />}
+          onClick={onRetry}
+        >
+          Retry
+        </Button>
+      }
+    >
+      {error}
+    </AlertBanner>
+  );
+};
 
 export const App: React.FC = () => {
-  const {
-    stats,
-    emails,
-    total,
-    page,
-    pageSize,
-    setPage,
-    statusFilter,
-    setStatusFilter,
-    routeTargetFilter,
-    setRouteTargetFilter,
-    searchInput,
-    setSearchInput,
-    isLoading,
-    isRefreshing,
-    error,
-    sessionExpired,
-    refreshAll,
-    isDetailOpen,
-    selectedEmail,
-    isDetailLoading,
-    actionLoading,
-    actionError,
-    openEmailDetail,
-    closeEmailDetail,
-    handleRetry,
-    handleReroute,
-    handleIgnore,
-  } = useIrisEmails();
+  const iris = useIrisEmails();
+  const hasActiveFilters =
+    iris.statusFilter !== 'all' ||
+    iris.routeTargetFilter !== 'all' ||
+    iris.searchInput.trim() !== '';
+  const summaryItems = buildSummaryItems(iris.stats, iris.statusFilter, iris.setStatusFilter);
 
-  const byStatus = stats?.by_status || {};
-  const totalCount = stats?.total ?? 0;
-  const needsReviewCount = byStatus.needs_review ?? 0;
-  const failedCount = byStatus.failed ?? 0;
-  const dispatchedCount = byStatus.dispatched ?? 0;
-
-  const summaryItems: SummaryMetricItem[] = [
-    {
-      id: 'total',
-      label: 'Total Captured',
-      icon: <Inbox className="w-3 h-3 text-sky-400" />,
-      value: (
-        <button
-          type="button"
-          onClick={() => setStatusFilter('all')}
-          className={`w-full rounded-lg px-1.5 py-0.5 transition-colors hover:bg-slate-800/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 cursor-pointer ${
-            statusFilter === 'all' ? 'underline decoration-sky-400 underline-offset-4' : ''
-          }`}
-        >
-          {totalCount}
-        </button>
-      ),
-      subvalue: 'All inbound mail',
-    },
-    {
-      id: 'needs_review',
-      label: 'Needs Review',
-      icon: <Clock className="w-3 h-3 text-amber-400" />,
-      valueClassName: 'text-amber-400',
-      value: (
-        <button
-          type="button"
-          onClick={() => setStatusFilter('needs_review')}
-          className={`w-full rounded-lg px-1.5 py-0.5 transition-colors hover:bg-slate-800/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/60 cursor-pointer ${
-            statusFilter === 'needs_review' ? 'underline decoration-amber-400 underline-offset-4' : ''
-          }`}
-        >
-          {needsReviewCount}
-        </button>
-      ),
-      subvalue: 'Operator queue',
-    },
-    {
-      id: 'failed',
-      label: 'Failed',
-      icon: <AlertTriangle className="w-3 h-3 text-rose-400" />,
-      valueClassName: 'text-rose-400',
-      value: (
-        <button
-          type="button"
-          onClick={() => setStatusFilter('failed')}
-          className={`w-full rounded-lg px-1.5 py-0.5 transition-colors hover:bg-slate-800/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/60 cursor-pointer ${
-            statusFilter === 'failed' ? 'underline decoration-rose-400 underline-offset-4' : ''
-          }`}
-        >
-          {failedCount}
-        </button>
-      ),
-      subvalue: 'Needs retry',
-    },
-    {
-      id: 'dispatched',
-      label: 'Dispatched',
-      icon: <CheckCircle2 className="w-3 h-3 text-emerald-400" />,
-      valueClassName: 'text-emerald-400',
-      value: (
-        <button
-          type="button"
-          onClick={() => setStatusFilter('dispatched')}
-          className={`w-full rounded-lg px-1.5 py-0.5 transition-colors hover:bg-slate-800/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 cursor-pointer ${
-            statusFilter === 'dispatched' ? 'underline decoration-emerald-400 underline-offset-4' : ''
-          }`}
-        >
-          {dispatchedCount}
-        </button>
-      ),
-      subvalue: 'Delivered cleanly',
-    },
-  ];
-
-  const header = (
-    <AppHeader
-      variant="blue"
-      title="Iris Gateway"
-      subtitle="Inbound Email Audit & Routing"
-      brandIcon={<Mail className="w-4 h-4" />}
-      onRefresh={() => void refreshAll()}
-      isRefreshing={isRefreshing}
-    />
-  );
+  const resetFilters = () => {
+    iris.setStatusFilter('all');
+    iris.setRouteTargetFilter('all');
+    iris.setSearchInput('');
+  };
 
   return (
-    <AppShell header={header}>
-      <div className="space-y-4 min-w-0">
-        {sessionExpired && <SessionExpiredBanner />}
-
-        {Boolean(error) && (
-          <AlertBanner
-            variant="error"
-            title="Unable to load audit feed"
-            action={
-              <Button
-                variant="secondary"
-                size="xs"
-                icon={<RefreshCw className="w-3 h-3" />}
-                onClick={() => void refreshAll()}
-              >
-                Retry
-              </Button>
-            }
-          >
-            {error}
-          </AlertBanner>
-        )}
-
-        <SummaryMetricGrid items={summaryItems} columns={4} />
-
-        <EmailFiltersBar
-          searchQuery={searchInput}
-          onSearchChange={setSearchInput}
-          statusFilter={statusFilter}
-          onStatusChange={setStatusFilter}
-          routeTargetFilter={routeTargetFilter}
-          onRouteTargetChange={setRouteTargetFilter}
+    <AppShell
+      header={
+        <AppHeader
+          variant="blue"
+          title="Iris Gateway"
+          subtitle="Inbound Email Audit & Routing"
+          brandIcon={<Mail className="w-4 h-4" />}
+          onRefresh={() => void iris.refreshAll()}
+          isRefreshing={iris.isRefreshing}
         />
-
-        {isLoading ? (
-          <LoadingState label="Loading inbound email ledger..." variant="blue" />
-        ) : emails.length === 0 ? (
-          <EmptyState
-            icon={<Inbox className="w-8 h-8" />}
-            title="No matching inbound emails"
-            description="Adjust your status, route target, or search filters, or forward a message to Iris to populate the audit feed."
-            action={
-              statusFilter !== 'all' || routeTargetFilter !== 'all' || searchInput.trim() !== '' ? (
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="min-h-[44px]"
-                  onClick={() => {
-                    setStatusFilter('all');
-                    setRouteTargetFilter('all');
-                    setSearchInput('');
-                  }}
-                >
-                  Clear Filters
-                </Button>
-              ) : undefined
-            }
-          />
-        ) : (
-          <div className="space-y-3 min-w-0">
-            {emails.map((email) => (
-              <EmailListRow
-                key={email.id}
-                email={email}
-                onSelect={(id) => void openEmailDetail(id)}
-              />
-            ))}
-          </div>
-        )}
-
+      }
+    >
+      <div className="space-y-4 min-w-0">
+        {iris.sessionExpired && <SessionExpiredBanner />}
+        <AuditFeedErrorBanner error={iris.error} onRetry={() => void iris.refreshAll()} />
+        <SummaryMetricGrid items={summaryItems} columns={4} variant="blue" />
+        <EmailFiltersBar
+          searchQuery={iris.searchInput}
+          onSearchChange={iris.setSearchInput}
+          statusFilter={iris.statusFilter}
+          onStatusChange={iris.setStatusFilter}
+          routeTargetFilter={iris.routeTargetFilter}
+          onRouteTargetChange={iris.setRouteTargetFilter}
+        />
+        <AuditFeedBody
+          isLoading={iris.isLoading}
+          emails={iris.emails}
+          hasActiveFilters={hasActiveFilters}
+          onResetFilters={resetFilters}
+          onSelectEmail={(id) => void iris.openEmailDetail(id)}
+        />
         <PaginationBar
-          page={page}
-          pageSize={pageSize}
-          totalItems={total}
-          onPageChange={setPage}
-          loading={isLoading || isRefreshing}
+          page={iris.page}
+          pageSize={iris.pageSize}
+          totalItems={iris.total}
+          onPageChange={iris.setPage}
+          loading={iris.isLoading || iris.isRefreshing}
           itemLabel="emails"
         />
       </div>
-
       <EmailDetailModal
-        isOpen={isDetailOpen}
-        onClose={closeEmailDetail}
-        email={selectedEmail}
-        isLoading={isDetailLoading}
-        actionLoading={actionLoading}
-        actionError={actionError}
-        onRetry={handleRetry}
-        onReroute={handleReroute}
-        onIgnore={handleIgnore}
+        isOpen={iris.isDetailOpen}
+        onClose={iris.closeEmailDetail}
+        email={iris.selectedEmail}
+        isLoading={iris.isDetailLoading}
+        actionLoading={iris.actionLoading}
+        actionError={iris.actionError}
+        onRetry={iris.handleRetry}
+        onReroute={iris.handleReroute}
+        onIgnore={iris.handleIgnore}
       />
     </AppShell>
   );
