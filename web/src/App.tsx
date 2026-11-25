@@ -140,6 +140,31 @@ const AuditFeedBody: React.FC<AuditFeedBodyProps> = ({
   );
 };
 
+const AuditFeedErrorBanner: React.FC<{
+  error: string | null;
+  onRetry: () => void;
+}> = ({ error, onRetry }) => {
+  if (!error) return null;
+  return (
+    <AlertBanner
+      variant="error"
+      title="Unable to load audit feed"
+      action={
+        <Button
+          variant="secondary"
+          size="xs"
+          icon={<RefreshCw className="w-3 h-3" />}
+          onClick={onRetry}
+        >
+          Retry
+        </Button>
+      }
+    >
+      {error}
+    </AlertBanner>
+  );
+};
+
 export const App: React.FC = () => {
   const iris = useIrisEmails();
   const hasActiveFilters =
@@ -169,27 +194,8 @@ export const App: React.FC = () => {
     >
       <div className="space-y-4 min-w-0">
         {iris.sessionExpired && <SessionExpiredBanner />}
-        {Boolean(iris.error) && (
-          <AlertBanner
-            variant="error"
-            title="Unable to load audit feed"
-            action={
-              <Button
-                variant="secondary"
-                size="xs"
-                icon={<RefreshCw className="w-3 h-3" />}
-                onClick={() => void iris.refreshAll()}
-              >
-                Retry
-              </Button>
-            }
-          >
-            {iris.error}
-          </AlertBanner>
-        )}
-
+        <AuditFeedErrorBanner error={iris.error} onRetry={() => void iris.refreshAll()} />
         <SummaryMetricGrid items={summaryItems} columns={4} variant="blue" />
-
         <EmailFiltersBar
           searchQuery={iris.searchInput}
           onSearchChange={iris.setSearchInput}
@@ -198,7 +204,6 @@ export const App: React.FC = () => {
           routeTargetFilter={iris.routeTargetFilter}
           onRouteTargetChange={iris.setRouteTargetFilter}
         />
-
         <AuditFeedBody
           isLoading={iris.isLoading}
           emails={iris.emails}
@@ -206,7 +211,6 @@ export const App: React.FC = () => {
           onResetFilters={resetFilters}
           onSelectEmail={(id) => void iris.openEmailDetail(id)}
         />
-
         <PaginationBar
           page={iris.page}
           pageSize={iris.pageSize}
@@ -216,7 +220,6 @@ export const App: React.FC = () => {
           itemLabel="emails"
         />
       </div>
-
       <EmailDetailModal
         isOpen={iris.isDetailOpen}
         onClose={iris.closeEmailDetail}
