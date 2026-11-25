@@ -1,14 +1,14 @@
 import hmac
 from typing import Optional
-from fastapi import Header, HTTPException, status
-from app.core.config import settings
+from fastapi import Header, HTTPException, Request, status
 
 
 def verify_webhook_secret(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> bool:
     """Validate Bearer token for inbound webhook requests using constant-time comparison."""
-    configured_secret = (settings.IRIS_WEBHOOK_SECRET or "").strip()
+    configured_secret = (request.app.state.container.settings.IRIS_WEBHOOK_SECRET or "").strip()
     if not configured_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -38,12 +38,14 @@ def verify_webhook_secret(
 
 
 def require_authentik_operator(
+    request: Request,
     x_authentik_username: Optional[str] = Header(default=None, alias="X-authentik-username"),
     x_authentik_email: Optional[str] = Header(default=None, alias="X-authentik-email"),
 ) -> str:
     """Require Authentik identity headers in production; return operator label for audit logs."""
     operator = (x_authentik_username or "").strip() or (x_authentik_email or "").strip()
-    if (settings.ENV or "").strip().lower() == "production":
+    env_value = (request.app.state.container.settings.ENV or "").strip().lower()
+    if env_value == "production":
         if not operator:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

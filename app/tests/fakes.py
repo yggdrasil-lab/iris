@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+from app.inbound.ports import PlutusDispatchRequest, PlutusDispatchResult
+
 
 @dataclass(frozen=True)
 class RecordedEmail:
@@ -166,3 +168,31 @@ class FakeClock:
     def advance(self, seconds: float) -> None:
         self._seconds += seconds
         self._utc = self._utc + timedelta(seconds=seconds)
+
+
+class InMemoryPlutusDispatcher:
+    """In-memory PlutusDispatchPort fake recording requests and returning typed outcomes."""
+
+    def __init__(
+        self,
+        *,
+        responses: Optional[Sequence[PlutusDispatchResult]] = None,
+        default_result: Optional[PlutusDispatchResult] = None,
+        handler: Optional[Callable[[PlutusDispatchRequest], PlutusDispatchResult]] = None,
+    ) -> None:
+        self.requests: list[PlutusDispatchRequest] = []
+        self._responses = list(responses) if responses is not None else []
+        self._default_result = default_result or PlutusDispatchResult(
+            status="dispatched",
+            consumer_ref="plutus-tx-1",
+        )
+        self._handler = handler
+
+    async def dispatch_email(self, request: PlutusDispatchRequest) -> PlutusDispatchResult:
+        self.requests.append(request)
+        if self._handler is not None:
+            return self._handler(request)
+        if self._responses:
+            return self._responses.pop(0)
+        return self._default_result
+

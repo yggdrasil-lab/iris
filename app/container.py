@@ -10,6 +10,13 @@ from app.alerting import (
     SystemClockAdapter,
 )
 from app.core.config import Settings, settings
+from app.inbound import (
+    HttpPlutusDispatchAdapter,
+    InboundConfig,
+    InboundEmailPipeline,
+    PlutusConfig,
+    PlutusDispatchPort,
+)
 from app.jev import JevClientPort, JevConfig, MuninnJevAdapter
 from app.mail import (
     Boto3SesAdapter,
@@ -26,6 +33,8 @@ class IrisContainer:
     mailer: OutboundMailer
     jev: JevClientPort
     alerter: OutboundAlerter
+    plutus: PlutusDispatchPort
+    inbound: InboundEmailPipeline
 
 
 def _build_alerting_config(resolved_settings: Settings) -> AlertingConfig:
@@ -50,6 +59,7 @@ def build_container(
     jev_client: Optional[JevClientPort] = None,
     discord_transport: Optional[DiscordTransportPort] = None,
     clock: Optional[ClockPort] = None,
+    plutus_dispatcher: Optional[PlutusDispatchPort] = None,
 ) -> IrisContainer:
     resolved_settings = settings_obj or settings
     adapter = ses_adapter or Boto3SesAdapter(
@@ -78,4 +88,26 @@ def build_container(
         jev=jev,
         clock=clock or SystemClockAdapter(),
     )
-    return IrisContainer(settings=resolved_settings, mailer=mailer, jev=jev, alerter=alerter)
+    plutus = plutus_dispatcher or HttpPlutusDispatchAdapter(
+        PlutusConfig(
+            api_url=resolved_settings.PLUTUS_API_URL,
+            webhook_secret=resolved_settings.PLUTUS_WEBHOOK_SECRET,
+        )
+    )
+    inbound = InboundEmailPipeline(
+        config=InboundConfig(
+            confidence_threshold=resolved_settings.IRIS_ALERT_CONFIDENCE_THRESHOLD,
+            plutus_dispatch_enabled=resolved_settings.IRIS_PLUTUS_DISPATCH_ENABLED,
+        ),
+        jev=jev,
+        plutus=plutus,
+        alerter=alerter,
+    )
+    return IrisContainer(
+        settings=resolved_settings,
+        mailer=mailer,
+        jev=jev,
+        alerter=alerter,
+        plutus=plutus,
+        inbound=inbound,
+    )

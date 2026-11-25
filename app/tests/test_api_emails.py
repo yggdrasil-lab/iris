@@ -2,15 +2,15 @@
 
 import base64
 from datetime import datetime, timezone
-import json as json_codec
-from typing import Any
+from typing import Callable
 
 from fastapi.testclient import TestClient
-import httpx
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.db.models import InboundEmail, InboundEmailAttachment
+from app.inbound.ports import PlutusDispatchResult
+from app.tests.conftest import IrisTestHarness
+from app.tests.fakes import InMemoryDiscordTransport, InMemoryJevClient, InMemoryPlutusDispatcher
 
 
 def _seed_emails(db: Session) -> tuple[InboundEmail, InboundEmail]:
@@ -37,7 +37,7 @@ def _seed_emails(db: Session) -> tuple[InboundEmail, InboundEmail]:
             "confidence": 0.96,
             "urgency_score": 8,
             "reason": "Bank alert",
-            "provider": "typesafe-jev",
+            "provider": "muninn-jev",
         },
         route_target="plutus_dbs_alert",
         dispatch_status="needs_review",
@@ -71,28 +71,30 @@ def _seed_emails(db: Session) -> tuple[InboundEmail, InboundEmail]:
 
 
 def test_api_emails_requires_authentik_headers_in_production(
-    client: TestClient, db_session: Session, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
     first, _ = _seed_emails(db_session)
-    monkeypatch.setattr(settings, "ENV", "production")
+    prod = make_harness(settings_overrides={"ENV": "production"})
 
-    assert client.get("/api/emails").status_code == 401
-    assert client.get("/api/emails/stats").status_code == 401
-    assert client.get(f"/api/emails/{first.id}").status_code == 401
-    assert client.post(f"/api/emails/{first.id}/retry").status_code == 401
-    assert client.post(f"/api/emails/{first.id}/reroute", json={"route_target": "ignore"}).status_code == 401
-    assert client.post(f"/api/emails/{first.id}/ignore").status_code == 401
+    assert prod.client.get("/api/emails").status_code == 401
+    assert prod.client.get("/api/emails/stats").status_code == 401
+    assert prod.client.get(f"/api/emails/{first.id}").status_code == 401
+    assert prod.client.post(f"/api/emails/{first.id}/retry").status_code == 401
+    assert prod.client.post(f"/api/emails/{first.id}/reroute", json={"route_target": "ignore"}).status_code == 401
+    assert prod.client.post(f"/api/emails/{first.id}/ignore").status_code == 401
 
-    resp_ok = client.get(
+    resp_ok = prod.client.get(
         "/api/emails",
-        headers={"X-authentik-username": "raymund"},
+        headers={"X-authentik-username": "operator1"},
     )
     assert resp_ok.status_code == 200
     assert resp_ok.json()["total"] == 2
 
 
 def test_api_emails_list_stats_detail_and_filters(
-    client: TestClient, db_session: Session
+    client: TestClient,
+    db_session: Session,
 ) -> None:
     first, _ = _seed_emails(db_session)
 
@@ -125,42 +127,37 @@ def test_api_emails_list_stats_detail_and_filters(
     assert client.get("/api/emails/999999").status_code == 404
 
 
-def test_api_emails_retry_reroute_and_ignore(
-    client: TestClient, db_session: Session, monkeypatch
+def test_api_emails_retry_reroute_and_ignore_fire_zero_discord_decision_alerts(
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
     first, second = _seed_emails(db_session)
+    plutus = InMemoryPlutusDispatcher(
+        responses=[
+            PlutusDispatchResult(status="dispatched", consumer_ref="plutus-tx-99"),
+            PlutusDispatchResult(status="dispatched", consumer_ref="plutus-tx-100"),
+        ]
+    )
+    discord = InMemoryDiscordTransport()
+    h = make_harness(
+        settings_overrides={
+            "IRIS_PLUTUS_DISPATCH_ENABLED": True,
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_INFO_ID": "chan-info-123",
+            "DISCORD_CHANNEL_ALERT_ID": "chan-alert-456",
+        },
+        plutus_dispatcher=plutus,
+        discord_transport=discord,
+    )
 
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
-
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
-            return httpx.Response(
-                200,
-                json={"consumer_ref": "plutus-tx-99"},
-                request=httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
-
-    retry_resp = client.post(f"/api/emails/{first.id}/retry")
+    retry_resp = h.client.post(f"/api/emails/{first.id}/retry")
     assert retry_resp.status_code == 200
     retry_data = retry_resp.json()
     assert retry_data["dispatch_status"] == "dispatched"
     assert retry_data["consumer_ref"] == "plutus-tx-99"
     assert retry_data["retry_count"] == 1
 
-    reroute_resp = client.post(
+    reroute_resp = h.client.post(
         f"/api/emails/{second.id}/reroute",
         json={"route_target": "plutus_purchase_receipt"},
     )
@@ -168,22 +165,28 @@ def test_api_emails_retry_reroute_and_ignore(
     reroute_data = reroute_resp.json()
     assert reroute_data["route_target"] == "plutus_purchase_receipt"
     assert reroute_data["dispatch_status"] == "dispatched"
+    assert reroute_data["consumer_ref"] == "plutus-tx-100"
     assert reroute_data["retry_count"] == 1
 
-    ignore_resp = client.post(f"/api/emails/{first.id}/ignore")
+    reroute_notice = h.client.post(
+        f"/api/emails/{second.id}/reroute",
+        json={"route_target": "actionable_notice"},
+    )
+    assert reroute_notice.status_code == 200
+    assert reroute_notice.json()["dispatch_status"] == "needs_review"
+
+    ignore_resp = h.client.post(f"/api/emails/{first.id}/ignore")
     assert ignore_resp.status_code == 200
     assert ignore_resp.json()["dispatch_status"] == "ignored"
 
+    assert len(plutus.requests) == 2
+    assert discord.posts == []
+
 
 def test_api_emails_payslip_reroute_and_reclassify_retry(
-    client: TestClient, db_session: Session, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
-
     encoded_pdf = base64.b64encode(b"%PDF-1.4\nAcme Payroll Payslip").decode("ascii")
 
     portal_notice = InboundEmail(
@@ -239,57 +242,27 @@ def test_api_emails_payslip_reroute_and_reclassify_retry(
     db_session.refresh(portal_notice)
     db_session.refresh(stranded_payslip)
 
-    plutus_payloads: list[dict[str, Any]] = []
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_payslip",
+            "has_actionable_amount": True,
+            "significance_score": 8,
+            "_confidence": 0.95,
+        }
+    )
+    plutus = InMemoryPlutusDispatcher(
+        responses=[
+            PlutusDispatchResult(status="dispatched", consumer_ref="receipt:88"),
+            PlutusDispatchResult(status="dispatched", consumer_ref="receipt:91"),
+        ]
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": True},
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+    )
 
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
-            if "muninn.local" in url:
-                return httpx.Response(
-                    200,
-                    json={
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": json_codec.dumps(
-                                        {
-                                            "route_target": "plutus_payslip",
-                                            "has_actionable_amount": True,
-                                            "significance_score": 8,
-                                            "_confidence": 0.95,
-                                        }
-                                    )
-                                }
-                            }
-                        ]
-                    },
-                    request=httpx.Request("POST", url),
-                )
-            plutus_payloads.append(json)
-            receipt_id = 88 if len(plutus_payloads) == 1 else 91
-            return httpx.Response(
-                200,
-                json={
-                    "status": "processed",
-                    "route_target": "plutus_payslip",
-                    "consumer_ref": f"receipt:{receipt_id}",
-                    "receipt_id": receipt_id,
-                    "receipt_ids": [receipt_id],
-                },
-                request=httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
-
-    reroute_resp = client.post(
+    reroute_resp = h.client.post(
         f"/api/emails/{portal_notice.id}/reroute",
         json={"route_target": "plutus_payslip"},
     )
@@ -300,7 +273,7 @@ def test_api_emails_payslip_reroute_and_reclassify_retry(
     assert reroute_data["consumer_ref"] == "receipt:88"
     assert reroute_data["error_detail"] is None
 
-    reclassify_resp = client.post(
+    reclassify_resp = h.client.post(
         f"/api/emails/{stranded_payslip.id}/retry",
         json={"reclassify": True},
     )
@@ -310,7 +283,8 @@ def test_api_emails_payslip_reroute_and_reclassify_retry(
     assert reclassify_data["dispatch_status"] == "dispatched"
     assert reclassify_data["consumer_ref"] == "receipt:91"
     assert reclassify_data["error_detail"] is None
-    assert len(plutus_payloads) == 2
-    assert plutus_payloads[1]["route_target"] == "plutus_payslip"
-    assert plutus_payloads[1]["attachments"][0]["filename"] == "payslip.pdf"
-    assert plutus_payloads[1]["attachments"][0]["content_base64"] == encoded_pdf
+
+    assert len(plutus.requests) == 2
+    assert plutus.requests[1].route_target == "plutus_payslip"
+    assert plutus.requests[1].attachments[0].filename == "payslip.pdf"
+    assert plutus.requests[1].attachments[0].content_base64 == encoded_pdf
