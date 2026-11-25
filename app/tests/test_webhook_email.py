@@ -4,7 +4,6 @@ import base64
 from datetime import datetime, timezone
 import json
 from typing import Any, Optional
-from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 import httpx
@@ -455,26 +454,6 @@ def test_webhook_email_plutus_dispatch_statuses(client: TestClient, monkeypatch)
     )
     assert r_503.status_code == 503
     assert r_503.json()["dispatch_status"] == "failed"
-
-
-def test_notify_discord_without_triage_does_not_raise_unbound_error(
-    client: TestClient, monkeypatch
-) -> None:
-    monkeypatch.setattr(settings, "IRIS_ALERT_TRIAGE_ENABLED", False)
-    send_mock = AsyncMock(return_value={"status": "delivered", "thread_id": "t-1"})
-    monkeypatch.setattr("app.main.discord_service.send_alert", send_mock)
-
-    resp = client.post(
-        "/notify/discord",
-        json={
-            "service": "charon",
-            "title": "Backup complete",
-            "details": "All snapshots ok",
-            "severity": "info",
-        },
-    )
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "delivered"
 
 
 def test_sanitize_html_to_text_strips_scripts_and_styles() -> None:

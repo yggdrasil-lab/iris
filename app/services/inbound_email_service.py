@@ -12,8 +12,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.alerting import (
+    AlertingConfig,
+    HttpDiscordTransportAdapter,
+    OutboundAlerter,
+    SystemClockAdapter,
+)
 from app.core.config import settings
 from app.db.models import InboundEmail, InboundEmailAttachment
+from app.jev import JevConfig, JevRouterUnavailableError, MuninnJevAdapter
 from app.models.schemas import (
     DiscordAlertRequest,
     EmailRouteVerdict,
@@ -22,10 +29,8 @@ from app.models.schemas import (
     RouteTargetType,
     TriageResult,
 )
-from app.services.discord_service import DiscordService
 from app.services.triage_service import (
     VALID_ROUTE_TARGETS,
-    JevRouterUnavailableError,
     TriageService,
 )
 
@@ -331,8 +336,37 @@ def _build_ingest_response(row: InboundEmail, status_label: Optional[str] = None
     )
 
 
+def _build_temporary_alerter() -> OutboundAlerter:
+    """Slice 3 temporary bridge reading runtime settings for inbound email notices."""
+    return OutboundAlerter(
+        config=AlertingConfig(
+            bot_token=settings.DISCORD_BOT_TOKEN,
+            alert_channel_id=settings.DISCORD_CHANNEL_ALERT_ID,
+            info_channel_id=settings.DISCORD_CHANNEL_INFO_ID,
+            health_channel_id=settings.DISCORD_CHANNEL_HEALTH_ID,
+            wealth_channel_id=settings.DISCORD_CHANNEL_WEALTH_ID,
+            default_user_id=settings.DISCORD_USER_ID,
+            default_cooldown_seconds=settings.DISCORD_DEFAULT_COOLDOWN_SECONDS,
+            alert_triage_enabled=settings.IRIS_ALERT_TRIAGE_ENABLED,
+            score_threshold=settings.IRIS_ALERT_SCORE_THRESHOLD,
+            confidence_threshold=settings.IRIS_ALERT_CONFIDENCE_THRESHOLD,
+        ),
+        discord=HttpDiscordTransportAdapter(),
+        jev=MuninnJevAdapter(
+            JevConfig(
+                muninn_base=settings.MUNINN_API_BASE,
+                muninn_api_key=settings.MUNINN_API_KEY,
+                muninn_jev_model=settings.MUNINN_JEV_MODEL,
+                score_threshold=settings.IRIS_ALERT_SCORE_THRESHOLD,
+                confidence_threshold=settings.IRIS_ALERT_CONFIDENCE_THRESHOLD,
+            )
+        ),
+        clock=SystemClockAdapter(),
+    )
+
+
 async def _notify_discord_best_effort(
-    discord_service: DiscordService,
+    discord_service: Optional[OutboundAlerter],
     title: str,
     details: str,
     severity: str = "error",
@@ -340,6 +374,7 @@ async def _notify_discord_best_effort(
 ) -> None:
     """Send best-effort Discord notice without ever raising into caller."""
     try:
+        alerter = discord_service or _build_temporary_alerter()
         triage_hint: Optional[TriageResult] = None
         if channel == "decisions":
             triage_hint = TriageResult(
@@ -360,7 +395,7 @@ async def _notify_discord_best_effort(
             destination_channel=channel,
             triage=False,
         )
-        await discord_service.send_alert(req, triage_result=triage_hint)
+        await alerter.send_alert(req, triage_result=triage_hint)
     except Exception as exc:
         logger.warning("Best-effort Discord notice skipped/failed (%s): %s", title, exc)
 
@@ -495,7 +530,7 @@ def _check_plutus_pre_dispatch_guard(
 async def _park_email_for_review(
     db: Session,
     email_row: InboundEmail,
-    discord_service: DiscordService,
+    discord_service: Optional[OutboundAlerter],
     notice: _ReviewGuardNotice,
 ) -> int:
     email_row.dispatch_status = "needs_review"
@@ -518,7 +553,7 @@ async def _dispatch_plutus_route(
     route_target: RouteTargetType,
     has_actionable_amount: bool,
     manual_reroute: bool,
-    discord_service: DiscordService,
+    discord_service: Optional[OutboundAlerter],
 ) -> int:
     if not manual_reroute:
         guard = _check_plutus_pre_dispatch_guard(email_row, route_target, has_actionable_amount)
@@ -559,7 +594,7 @@ async def _dispatch_routed_email(
     route_target: RouteTargetType,
     has_actionable_amount: bool,
     manual_reroute: bool,
-    discord_service: DiscordService,
+    discord_service: Optional[OutboundAlerter],
 ) -> int:
     """Apply routing rules and downstream consumer dispatch, returning HTTP status code."""
     email_row.route_target = route_target
@@ -591,31 +626,11 @@ async def _dispatch_routed_email(
     return 200
 
 
-async def ingest_email(
-    db: Session,
+def _build_inbound_email_row(
     payload: InboundEmailWebhookPayload,
-    triage_service: Optional[TriageService] = None,
-    discord_service: Optional[DiscordService] = None,
-) -> Tuple[InboundEmailIngestResponse, int]:
-    """Persist, classify, and dispatch an inbound email idempotently."""
-    triage = triage_service or TriageService()
-    discord = discord_service or DiscordService()
-
-    received_at = _ensure_utc(payload.received_at)
-    message_id = normalize_message_id(
-        raw_message_id=payload.message_id,
-        from_address=payload.from_address,
-        subject=payload.subject,
-        received_at=received_at,
-        text_body=payload.text_body,
-    )
-
-    existing = db.scalar(
-        select(InboundEmail).where(InboundEmail.message_id == message_id)
-    )
-    if existing is not None:
-        return _build_ingest_response(existing, status_label="duplicate", duplicate=True), 200
-
+    message_id: str,
+    received_at: datetime,
+) -> InboundEmail:
     attachments_meta: List[Dict[str, Any]] = []
     attachment_rows: List[InboundEmailAttachment] = []
     for att in payload.attachments:
@@ -639,9 +654,7 @@ async def ingest_email(
                 content_base64=att.content_base64,
             )
         )
-
-    raw_excerpt = build_raw_excerpt(payload.text_body, payload.html_body)
-    email_row = InboundEmail(
+    return InboundEmail(
         message_id=message_id,
         from_address=payload.from_address.strip(),
         to_address=payload.to_address.strip(),
@@ -649,13 +662,31 @@ async def ingest_email(
         received_at=received_at,
         text_body=_truncate_body(payload.text_body),
         html_excerpt=clean_html_for_storage(payload.html_body),
-        raw_excerpt=raw_excerpt,
+        raw_excerpt=build_raw_excerpt(payload.text_body, payload.html_body),
         attachments_meta=attachments_meta,
         route_target="unclassified",
         dispatch_status="received",
         attachments=attachment_rows,
     )
 
+
+def _persist_inbound_email(
+    db: Session,
+    payload: InboundEmailWebhookPayload,
+) -> Tuple[InboundEmail, bool]:
+    received_at = _ensure_utc(payload.received_at)
+    message_id = normalize_message_id(
+        raw_message_id=payload.message_id,
+        from_address=payload.from_address,
+        subject=payload.subject,
+        received_at=received_at,
+        text_body=payload.text_body,
+    )
+    existing = db.scalar(select(InboundEmail).where(InboundEmail.message_id == message_id))
+    if existing is not None:
+        return existing, True
+
+    email_row = _build_inbound_email_row(payload, message_id, received_at)
     db.add(email_row)
     try:
         db.commit()
@@ -665,15 +696,24 @@ async def ingest_email(
             select(InboundEmail).where(InboundEmail.message_id == message_id)
         )
         if existing_after_race is not None:
-            return (
-                _build_ingest_response(existing_after_race, status_label="duplicate", duplicate=True),
-                200,
-            )
+            return existing_after_race, True
         raise
-
     db.refresh(email_row)
-    # Eagerly load attachments so Plutus dispatch has them ready
     _ = list(email_row.attachments)
+    return email_row, False
+
+
+async def ingest_email(
+    db: Session,
+    payload: InboundEmailWebhookPayload,
+    triage_service: Optional[TriageService] = None,
+    discord_service: Optional[OutboundAlerter] = None,
+) -> Tuple[InboundEmailIngestResponse, int]:
+    """Persist, classify, and dispatch an inbound email idempotently."""
+    triage = triage_service or TriageService()
+    email_row, is_duplicate = _persist_inbound_email(db, payload)
+    if is_duplicate:
+        return _build_ingest_response(email_row, status_label="duplicate", duplicate=True), 200
 
     try:
         verdict = await triage.route_inbound_email(
@@ -690,7 +730,7 @@ async def ingest_email(
         db.commit()
         db.refresh(email_row)
         await _notify_discord_best_effort(
-            discord,
+            discord_service,
             title=f"Jev Email Router Unavailable: Email #{email_row.id}",
             details=f"From: {email_row.from_address}\nSubject: {email_row.subject}\nError: {exc}",
             severity="error",
@@ -700,25 +740,17 @@ async def ingest_email(
 
     email_row.jev_verdict = verdict.model_dump()
     email_row.route_target = verdict.route_target
-
     if verdict.confidence < settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:
-        email_row.dispatch_status = "needs_review"
-        email_row.error_detail = (
-            f"low_confidence: {verdict.confidence:.2f} < {settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:.2f}"
-        )
-        db.commit()
-        db.refresh(email_row)
-        await _notify_discord_best_effort(
-            discord,
+        notice = _ReviewGuardNotice(
+            error_detail=f"low_confidence: {verdict.confidence:.2f} < {settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:.2f}",
             title=f"Low-Confidence Email Needs Review: {email_row.subject or '(no subject)'}",
             details=(
                 f"Email #{email_row.id} from {email_row.from_address}\n"
                 f"Suggested route: {verdict.route_target} (confidence {verdict.confidence:.2f})\n"
                 f"Reason: {verdict.reason}"
             ),
-            severity="warning",
-            channel="decisions",
         )
+        await _park_email_for_review(db, email_row, discord_service, notice)
         return _build_ingest_response(email_row), 200
 
     status_code = await _dispatch_routed_email(
@@ -727,7 +759,7 @@ async def ingest_email(
         route_target=verdict.route_target,
         has_actionable_amount=verdict.has_actionable_amount,
         manual_reroute=False,
-        discord_service=discord,
+        discord_service=discord_service,
     )
     return _build_ingest_response(email_row), status_code
 
@@ -798,65 +830,79 @@ def get_email_stats(db: Session) -> Tuple[int, Dict[str, int], Dict[str, int]]:
     return total, by_status, by_route_target
 
 
+async def _reclassify_and_dispatch(
+    db: Session,
+    email_row: InboundEmail,
+    *,
+    reclassify: bool,
+    triage: TriageService,
+    discord_service: Optional[OutboundAlerter],
+) -> Tuple[InboundEmail, int]:
+    if email_row.text_body is not None or email_row.html_excerpt is not None:
+        email_row.raw_excerpt = build_raw_excerpt(email_row.text_body, email_row.html_excerpt)
+    try:
+        verdict = await triage.route_inbound_email(
+            from_address=email_row.from_address,
+            to_address=email_row.to_address,
+            subject=email_row.subject,
+            received_at=email_row.received_at,
+            raw_excerpt=email_row.raw_excerpt or "",
+            attachments_meta=email_row.attachments_meta or [],
+        )
+    except JevRouterUnavailableError as exc:
+        email_row.dispatch_status = "failed"
+        email_row.error_detail = f"jev_router_unavailable: {exc}"
+        db.commit()
+        db.refresh(email_row)
+        return email_row, 503
+
+    email_row.jev_verdict = verdict.model_dump()
+    email_row.route_target = verdict.route_target
+    if reclassify and verdict.confidence < settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:
+        email_row.dispatch_status = "needs_review"
+        email_row.error_detail = (
+            f"low_confidence: {verdict.confidence:.2f} < {settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:.2f}"
+        )
+        db.commit()
+        db.refresh(email_row)
+        return email_row, 200
+
+    status_code = await _dispatch_routed_email(
+        db=db,
+        email_row=email_row,
+        route_target=verdict.route_target,
+        has_actionable_amount=verdict.has_actionable_amount,
+        manual_reroute=not reclassify,
+        discord_service=discord_service,
+    )
+    return email_row, status_code
+
+
 async def retry_email(
     db: Session,
     email_id: int,
     reclassify: bool = False,
     triage_service: Optional[TriageService] = None,
-    discord_service: Optional[DiscordService] = None,
+    discord_service: Optional[OutboundAlerter] = None,
 ) -> Tuple[Optional[InboundEmail], int]:
     """Retry dispatching an inbound email, optionally re-running Jev classification."""
     email_row = get_email_with_attachments(db, email_id)
     if email_row is None:
         return None, 404
 
-    triage = triage_service or TriageService()
-    discord = discord_service or DiscordService()
-
     email_row.retry_count += 1
     email_row.error_detail = None
-
-    needs_classify = reclassify or email_row.route_target not in VALID_ROUTE_TARGETS or not email_row.jev_verdict
+    needs_classify = (
+        reclassify or email_row.route_target not in VALID_ROUTE_TARGETS or not email_row.jev_verdict
+    )
     if needs_classify:
-        if email_row.text_body is not None or email_row.html_excerpt is not None:
-            email_row.raw_excerpt = build_raw_excerpt(email_row.text_body, email_row.html_excerpt)
-        try:
-            verdict = await triage.route_inbound_email(
-                from_address=email_row.from_address,
-                to_address=email_row.to_address,
-                subject=email_row.subject,
-                received_at=email_row.received_at,
-                raw_excerpt=email_row.raw_excerpt or "",
-                attachments_meta=email_row.attachments_meta or [],
-            )
-        except JevRouterUnavailableError as exc:
-            email_row.dispatch_status = "failed"
-            email_row.error_detail = f"jev_router_unavailable: {exc}"
-            db.commit()
-            db.refresh(email_row)
-            return email_row, 503
-
-        email_row.jev_verdict = verdict.model_dump()
-        email_row.route_target = verdict.route_target
-
-        if reclassify and verdict.confidence < settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:
-            email_row.dispatch_status = "needs_review"
-            email_row.error_detail = (
-                f"low_confidence: {verdict.confidence:.2f} < {settings.IRIS_ALERT_CONFIDENCE_THRESHOLD:.2f}"
-            )
-            db.commit()
-            db.refresh(email_row)
-            return email_row, 200
-
-        status_code = await _dispatch_routed_email(
-            db=db,
-            email_row=email_row,
-            route_target=verdict.route_target,
-            has_actionable_amount=verdict.has_actionable_amount,
-            manual_reroute=not reclassify,
-            discord_service=discord,
+        return await _reclassify_and_dispatch(
+            db,
+            email_row,
+            reclassify=reclassify,
+            triage=triage_service or TriageService(),
+            discord_service=discord_service,
         )
-        return email_row, status_code
 
     existing_route: RouteTargetType = email_row.route_target  # type: ignore[assignment]
     status_code = await _dispatch_routed_email(
@@ -865,7 +911,7 @@ async def retry_email(
         route_target=existing_route,
         has_actionable_amount=True,
         manual_reroute=True,
-        discord_service=discord,
+        discord_service=discord_service,
     )
     return email_row, status_code
 
@@ -874,14 +920,14 @@ async def reroute_email(
     db: Session,
     email_id: int,
     new_target: RouteTargetType,
-    discord_service: Optional[DiscordService] = None,
+    discord_service: Optional[OutboundAlerter] = None,
 ) -> Tuple[Optional[InboundEmail], int]:
     """Manually re-route an email to a target consumer and dispatch."""
     email_row = get_email_with_attachments(db, email_id)
     if email_row is None:
         return None, 404
 
-    discord = discord_service or DiscordService()
+    discord = discord_service
     email_row.retry_count += 1
     email_row.error_detail = None
     email_row.route_target = new_target
