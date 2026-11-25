@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from typing import Any, Optional
+from fastapi import Request
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import settings
@@ -43,9 +44,10 @@ def dispose_engines() -> None:
     _session_factories.clear()
 
 
-def get_db() -> Generator[Session, None, None]:
+def get_db(request: Request) -> Generator[Session, None, None]:
     """FastAPI dependency yielding an active SQLAlchemy session."""
-    db = get_session_factory()()
+    database_url = request.app.state.container.settings.resolved_database_url()
+    db = get_session_factory(database_url)()
     try:
         yield db
     finally:

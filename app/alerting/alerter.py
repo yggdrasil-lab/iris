@@ -1,7 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from app.alerting.alertmanager import build_alertmanager_request
 from app.alerting.ports import AlertingConfig, ClockPort, DiscordTransportPort
@@ -209,6 +209,32 @@ class OutboundAlerter:
         )
         return await self.notify_discord(alert_req)
 
+    async def send_operator_notice(
+        self,
+        *,
+        service: str,
+        bot_name: str,
+        title: str,
+        details: str,
+        severity: Literal["error", "warning"] = "warning",
+        destination_channel: str = "decisions",
+    ) -> Optional[Dict[str, Any]]:
+        """Deliver a best-effort non-triaged operator notice without raising into callers."""
+        req = DiscordAlertRequest(
+            service=service,
+            bot_name=bot_name,
+            title=title[:120],
+            details=details[:1500],
+            severity=severity,
+            destination_channel=destination_channel,
+            triage=False,
+        )
+        try:
+            return await self.send_alert(req)
+        except Exception as exc:
+            logger.warning("Best-effort operator notice skipped/failed (%s): %s", title, exc)
+            return None
+
     async def _send_resolution(
         self,
         *,
@@ -221,24 +247,25 @@ class OutboundAlerter:
         async with self._lock:
             incident = self._incidents.get(slug)
             thread_id = incident.thread_id if incident else None
-            payload = _build_discord_message_payload(
-                bot_name=bot_name,
-                avatar_url=request.avatar_url,
-                mention="",
-                service=request.service,
-                node=request.node,
-                severity="info",
-                title=f"Resolved: {request.title}",
-                details=request.details,
-                timestamp_iso=self._clock.now_utc().isoformat(),
-            )
-            result, resolved_thread_id = await self._discord.post_message(
-                bot_token=bot_token,
-                channel_id=channel_id,
-                thread_name=f"✅ {request.service} Resolved: {request.title}",
-                message_payload=payload,
-                thread_id=thread_id,
-            )
+        payload = _build_discord_message_payload(
+            bot_name=bot_name,
+            avatar_url=request.avatar_url,
+            mention="",
+            service=request.service,
+            node=request.node,
+            severity="info",
+            title=f"Resolved: {request.title}",
+            details=request.details,
+            timestamp_iso=self._clock.now_utc().isoformat(),
+        )
+        result, resolved_thread_id = await self._discord.post_message(
+            bot_token=bot_token,
+            channel_id=channel_id,
+            thread_name=f"✅ {request.service} Resolved: {request.title}",
+            message_payload=payload,
+            thread_id=thread_id,
+        )
+        async with self._lock:
             self._incidents.pop(slug, None)
         return {
             "status": "resolved",

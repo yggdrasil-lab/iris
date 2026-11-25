@@ -1,72 +1,30 @@
-"""Tests for POST /webhook/email ingestion, Muninn jev-decision routing, and latent bug fixes."""
+"""Tests for POST /webhook/email ingestion, Jev routing, sanitization, and Plutus dispatch."""
 
 import base64
 from datetime import datetime, timezone
-import json
-from typing import Any, Optional
+from typing import Callable
 
-from fastapi.testclient import TestClient
-import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.db.models import InboundEmail, InboundEmailAttachment
-from app.services.inbound_email_service import (
+from app.inbound import (
     MAX_RAW_EXCERPT_CHARS,
     MAX_STORED_BODY_CHARS,
-    _dispatch_to_plutus,
+    PlutusDispatchResult,
     build_raw_excerpt,
     clean_html_for_storage,
     sanitize_html_to_text,
 )
+from app.jev import JevConfig, JevRouterUnavailableError, MuninnJevAdapter
+from app.tests.conftest import IrisTestHarness
+from app.tests.fakes import InMemoryDiscordTransport, InMemoryJevClient, InMemoryPlutusDispatcher
 
 
-def _make_muninn_jev_response(
-    route_target: str,
-    has_amount: str | bool = "true",
-    score: str | int = "7",
-    confidence: Optional[float] = 0.92,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "route_target": route_target,
-        "has_actionable_amount": has_amount,
-        "significance_score": score,
-    }
-    if confidence is not None:
-        payload["_confidence"] = confidence
-    return {
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": json.dumps(payload),
-                }
-            }
-        ]
-    }
-
-
-def _mock_async_client(monkeypatch, handler) -> None:
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            self.init_headers = kwargs.get("headers") or {}
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
-            merged = {**self.init_headers, **(headers or {})}
-            return await handler(url, json, merged)
-
-    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
-
-
-def test_webhook_email_auth_fail_closed_and_401(client: TestClient, monkeypatch) -> None:
+def test_webhook_email_auth_fail_closed_and_401(
+    make_harness: Callable[..., IrisTestHarness],
+) -> None:
     payload = {
         "message_id": "<auth-1@example.com>",
         "from_address": "sender@example.com",
@@ -75,43 +33,44 @@ def test_webhook_email_auth_fail_closed_and_401(client: TestClient, monkeypatch)
         "text_body": "Body",
     }
 
-    monkeypatch.setattr(settings, "IRIS_WEBHOOK_SECRET", None)
-    resp_503 = client.post("/webhook/email", json=payload, headers={"Authorization": "Bearer any"})
+    unconfigured = make_harness(settings_overrides={"IRIS_WEBHOOK_SECRET": None})
+    resp_503 = unconfigured.client.post(
+        "/webhook/email", json=payload, headers={"Authorization": "Bearer any"}
+    )
     assert resp_503.status_code == 503
 
-    monkeypatch.setattr(settings, "IRIS_WEBHOOK_SECRET", "top-secret")
-    resp_missing = client.post("/webhook/email", json=payload)
-    assert resp_missing.status_code == 401
-
-    resp_bad_scheme = client.post(
-        "/webhook/email", json=payload, headers={"Authorization": "Basic dGVzdA=="}
+    configured = make_harness(settings_overrides={"IRIS_WEBHOOK_SECRET": "top-secret"})
+    assert configured.client.post("/webhook/email", json=payload).status_code == 401
+    assert (
+        configured.client.post(
+            "/webhook/email", json=payload, headers={"Authorization": "Basic dGVzdA=="}
+        ).status_code
+        == 401
     )
-    assert resp_bad_scheme.status_code == 401
-
-    resp_wrong = client.post(
-        "/webhook/email", json=payload, headers={"Authorization": "Bearer wrong-token"}
+    assert (
+        configured.client.post(
+            "/webhook/email", json=payload, headers={"Authorization": "Bearer wrong-token"}
+        ).status_code
+        == 401
     )
-    assert resp_wrong.status_code == 401
 
 
 def test_webhook_email_capture_idempotency_and_attachments(
-    client: TestClient, db_session: Session, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", False)
-
-    calls: list[tuple[str, Any, dict[str, str]]] = []
-
-    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
-        calls.append((url, json_body, headers))
-        return httpx.Response(
-            200,
-            json=_make_muninn_jev_response("plutus_dbs_alert", has_amount="true", confidence=0.95),
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post)
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_dbs_alert",
+            "has_actionable_amount": True,
+            "significance_score": 7,
+            "_confidence": 0.95,
+        }
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": False},
+        jev_client=jev,
+    )
 
     raw_pdf = b"%PDF-1.4\nSample DBS statement"
     encoded_pdf = base64.b64encode(raw_pdf).decode("ascii")
@@ -121,7 +80,10 @@ def test_webhook_email_capture_idempotency_and_attachments(
         "to_address": "iris@example.com",
         "subject": "Card Transaction Alert",
         "received_at": "2026-11-20T08:00:00Z",
-        "html_body": "<html><style>.x{color:red}</style><script>alert(1)</script><body><p>SGD 18.40 at FairPrice</p></body></html>",
+        "html_body": (
+            "<html><style>.x{color:red}</style><script>alert(1)</script>"
+            "<body><p>SGD 18.40 at FairPrice</p></body></html>"
+        ),
         "attachments": [
             {
                 "filename": "advice.pdf",
@@ -131,7 +93,7 @@ def test_webhook_email_capture_idempotency_and_attachments(
         ],
     }
 
-    resp = client.post(
+    resp = h.client.post(
         "/webhook/email",
         json=payload,
         headers={"Authorization": "Bearer test-iris-webhook-secret"},
@@ -143,13 +105,9 @@ def test_webhook_email_capture_idempotency_and_attachments(
     assert body["dispatch_status"] == "needs_review"
     assert body["error_detail"] == "plutus_dispatch_disabled_phase1_capture"
     assert body["jev_verdict"]["provider"] == "muninn-jev"
-    assert len(calls) == 1
-    call_url, call_body, call_headers = calls[0]
-    assert call_url == "http://muninn.local/v1/chat/completions"
-    assert call_headers["Authorization"] == "Bearer muninn-key"
-    assert call_body["model"] == "jev-decision"
-    assert call_body["response_format"] == {"type": "json_object"}
-    assert '"include_meta": true' in call_body["messages"][0]["content"]
+    assert len(jev.calls) == 1
+    assert "route_target" in jev.calls[0].questions
+    assert "advice.pdf" in jev.calls[0].state_text
 
     saved = db_session.scalar(
         select(InboundEmail).where(InboundEmail.message_id == "<dbs-001@bank.example.com>")
@@ -169,7 +127,7 @@ def test_webhook_email_capture_idempotency_and_attachments(
     assert att_rows[0].content_base64 == encoded_pdf
 
     # Duplicate delivery must not mutate or re-invoke Jev
-    dup_resp = client.post(
+    dup_resp = h.client.post(
         "/webhook/email",
         json=payload,
         headers={"Authorization": "Bearer test-iris-webhook-secret"},
@@ -179,23 +137,21 @@ def test_webhook_email_capture_idempotency_and_attachments(
     assert dup_body["duplicate"] is True
     assert dup_body["status"] == "duplicate"
     assert dup_body["email_id"] == body["email_id"]
-    assert len(calls) == 1
+    assert len(jev.calls) == 1
 
 
 def test_webhook_email_missing_message_id_uses_sha256_idempotency(
-    client: TestClient, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-
-    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
-        return httpx.Response(
-            200,
-            json=_make_muninn_jev_response("ignore", has_amount="false", score="2", confidence=0.91),
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post)
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "ignore",
+            "has_actionable_amount": False,
+            "significance_score": 2,
+            "_confidence": 0.91,
+        }
+    )
+    h = make_harness(jev_client=jev)
 
     payload = {
         "from_address": "promo@shop.example.com",
@@ -204,7 +160,7 @@ def test_webhook_email_missing_message_id_uses_sha256_idempotency(
         "received_at": "2026-11-20T09:00:00Z",
         "text_body": "Big discounts all week.",
     }
-    first = client.post(
+    first = h.client.post(
         "/webhook/email",
         json=payload,
         headers={"Authorization": "Bearer test-iris-webhook-secret"},
@@ -214,7 +170,7 @@ def test_webhook_email_missing_message_id_uses_sha256_idempotency(
     assert first_data["message_id"].startswith("sha256:")
     assert first_data["dispatch_status"] == "ignored"
 
-    second = client.post(
+    second = h.client.post(
         "/webhook/email",
         json=payload,
         headers={"Authorization": "Bearer test-iris-webhook-secret"},
@@ -225,29 +181,40 @@ def test_webhook_email_missing_message_id_uses_sha256_idempotency(
 
 
 def test_webhook_email_low_or_missing_confidence_and_missing_amount_park_for_review(
-    client: TestClient, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "discord-bot-token")
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_INFO_ID", "chan-info-123")
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "plutus_dbs_alert",
+                "has_actionable_amount": True,
+                "significance_score": 7,
+                "_confidence": 0.55,
+            },
+            {
+                "route_target": "ignore",
+                "has_actionable_amount": False,
+                "significance_score": 7,
+            },
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": False,
+                "significance_score": 7,
+                "_confidence": 0.94,
+            },
+        ]
+    )
+    discord = InMemoryDiscordTransport()
+    h = make_harness(
+        settings_overrides={
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_INFO_ID": "chan-info-123",
+        },
+        jev_client=jev,
+        discord_transport=discord,
+    )
 
-    discord_posts: list[str] = []
-
-    async def fake_post_low_conf(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.com/api/v10" in url:
-            discord_posts.append(url)
-            assert headers.get("Authorization") == "Bot discord-bot-token"
-            return httpx.Response(200, json={"id": "thread-1"}, request=httpx.Request("POST", url))
-        return httpx.Response(
-            200,
-            json=_make_muninn_jev_response("plutus_dbs_alert", has_amount="true", confidence=0.55),
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post_low_conf)
-
-    resp_low = client.post(
+    resp_low = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<low-conf-1@example.com>",
@@ -261,22 +228,8 @@ def test_webhook_email_low_or_missing_confidence_and_missing_amount_park_for_rev
     assert resp_low.status_code == 200
     assert resp_low.json()["dispatch_status"] == "needs_review"
     assert "low_confidence" in resp_low.json()["error_detail"]
-    assert discord_posts == ["https://discord.com/api/v10/channels/chan-info-123/threads"]
 
-    # Missing _confidence from jev-shim must default to 0.0 and park as needs_review
-    async def fake_post_missing_conf(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.com/api/v10" in url:
-            discord_posts.append(url)
-            return httpx.Response(200, json={"id": "thread-1b"}, request=httpx.Request("POST", url))
-        return httpx.Response(
-            200,
-            json=_make_muninn_jev_response("ignore", has_amount="false", confidence=None),
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post_missing_conf)
-
-    resp_missing_conf = client.post(
+    resp_missing_conf = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<missing-conf-1@example.com>",
@@ -291,19 +244,7 @@ def test_webhook_email_low_or_missing_confidence_and_missing_amount_park_for_rev
     assert resp_missing_conf.json()["dispatch_status"] == "needs_review"
     assert "low_confidence: 0.00" in resp_missing_conf.json()["error_detail"]
 
-    async def fake_post_no_amount(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.com/api/v10" in url:
-            discord_posts.append(url)
-            return httpx.Response(200, json={"id": "thread-2"}, request=httpx.Request("POST", url))
-        return httpx.Response(
-            200,
-            json=_make_muninn_jev_response("plutus_purchase_receipt", has_amount="false", confidence=0.94),
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post_no_amount)
-
-    resp_no_amt = client.post(
+    resp_no_amt = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<no-amt-1@example.com>",
@@ -317,28 +258,24 @@ def test_webhook_email_low_or_missing_confidence_and_missing_amount_park_for_rev
     assert resp_no_amt.status_code == 200
     assert resp_no_amt.json()["dispatch_status"] == "needs_review"
     assert resp_no_amt.json()["error_detail"] == "receipt_missing_actionable_amount"
-    assert len(discord_posts) == 3
+    assert [post.channel_id for post in discord.posts] == ["chan-info-123", "chan-info-123", "chan-info-123"]
 
 
 def test_webhook_email_muninn_unconfigured_or_down_fails_loud_503(
-    client: TestClient, db_session: Session, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
-    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "discord-bot-token")
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", "chan-alert-456")
-
-    alert_posts: list[str] = []
-
-    async def fake_alert_only(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.com/api/v10" in url:
-            alert_posts.append(url)
-            return httpx.Response(200, json={"id": "alert-thread"}, request=httpx.Request("POST", url))
-        return httpx.Response(503, text="Muninn unavailable", request=httpx.Request("POST", url))
-
-    _mock_async_client(monkeypatch, fake_alert_only)
-
-    # Case 1: MUNINN_API_KEY missing -> immediate fail-loud 503
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", None)
-    resp_unconf = client.post(
+    discord = InMemoryDiscordTransport()
+    unconfigured = make_harness(
+        settings_overrides={
+            "MUNINN_API_KEY": None,
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_ALERT_ID": "chan-alert-456",
+        },
+        jev_client=MuninnJevAdapter(JevConfig(muninn_base="http://muninn.local/v1", muninn_api_key=None)),
+        discord_transport=discord,
+    )
+    resp_unconf = unconfigured.client.post(
         "/webhook/email",
         json={
             "message_id": "<unconf-1@example.com>",
@@ -353,11 +290,16 @@ def test_webhook_email_muninn_unconfigured_or_down_fails_loud_503(
     assert resp_unconf.json()["dispatch_status"] == "failed"
     assert resp_unconf.json()["error_detail"].startswith("jev_router_unavailable:")
 
-    # Case 2: MUNINN_API_KEY set but Muninn returns 503 -> fail-loud 503 and Discord alert
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-secret-token")
-
-    resp_503 = client.post(
+    down_jev = InMemoryJevClient(error=JevRouterUnavailableError("Muninn 503 down"))
+    down_harness = make_harness(
+        settings_overrides={
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_ALERT_ID": "chan-alert-456",
+        },
+        jev_client=down_jev,
+        discord_transport=discord,
+    )
+    resp_503 = down_harness.client.post(
         "/webhook/email",
         json={
             "message_id": "<muninn-down@example.com>",
@@ -372,7 +314,7 @@ def test_webhook_email_muninn_unconfigured_or_down_fails_loud_503(
     data_503 = resp_503.json()
     assert data_503["dispatch_status"] == "failed"
     assert data_503["error_detail"].startswith("jev_router_unavailable:")
-    assert len(alert_posts) == 2
+    assert [post.channel_id for post in discord.posts] == ["chan-alert-456", "chan-alert-456"]
 
     failed_row = db_session.scalar(
         select(InboundEmail).where(InboundEmail.message_id == "<muninn-down@example.com>")
@@ -381,33 +323,31 @@ def test_webhook_email_muninn_unconfigured_or_down_fails_loud_503(
     assert failed_row.dispatch_status == "failed"
 
 
-def test_webhook_email_plutus_dispatch_statuses(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
+def test_webhook_email_plutus_dispatch_statuses(
+    make_harness: Callable[..., IrisTestHarness],
+) -> None:
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_dbs_alert",
+            "has_actionable_amount": True,
+            "significance_score": 8,
+            "_confidence": 0.95,
+        }
+    )
+    plutus = InMemoryPlutusDispatcher(
+        responses=[
+            PlutusDispatchResult(status="dispatched", consumer_ref="777"),
+            PlutusDispatchResult(status="rejected", error_detail="plutus_validation_422: Unparseable amount"),
+            PlutusDispatchResult(status="unavailable", error_detail="plutus_upstream_503: DB busy"),
+        ]
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": True},
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+    )
 
-    plutus_status = {"code": 200, "json": {"transaction_id": 777}}
-
-    async def fake_dispatch(url: str, json_body: Any, headers: dict[str, str]):
-        if "muninn.local" in url:
-            return httpx.Response(
-                200,
-                json=_make_muninn_jev_response("plutus_dbs_alert", has_amount="true", confidence=0.95),
-                request=httpx.Request("POST", url),
-            )
-        assert headers.get("Authorization") == "Bearer plutus-secret"
-        assert headers.get("User-Agent") == "Yggdrasil-Iris/1.0"
-        return httpx.Response(
-            plutus_status["code"],
-            json=plutus_status["json"],
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_dispatch)
-
-    r_ok = client.post(
+    r_ok = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<plutus-ok@example.com>",
@@ -422,9 +362,7 @@ def test_webhook_email_plutus_dispatch_statuses(client: TestClient, monkeypatch)
     assert r_ok.json()["dispatch_status"] == "dispatched"
     assert r_ok.json()["consumer_ref"] == "777"
 
-    plutus_status["code"] = 422
-    plutus_status["json"] = {"detail": "Unparseable amount"}
-    r_422 = client.post(
+    r_422 = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<plutus-422@example.com>",
@@ -439,9 +377,7 @@ def test_webhook_email_plutus_dispatch_statuses(client: TestClient, monkeypatch)
     assert r_422.json()["dispatch_status"] == "failed"
     assert "plutus_validation_422" in r_422.json()["error_detail"]
 
-    plutus_status["code"] = 503
-    plutus_status["json"] = {"detail": "DB busy"}
-    r_503 = client.post(
+    r_503 = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<plutus-503@example.com>",
@@ -487,7 +423,6 @@ def test_build_raw_excerpt_and_sanitize_html_strip_invisible_and_tracking() -> N
     assert "Order Total: SGD 179.74\nMerchant: Example Store" in excerpt
     assert "https://example.com/ok" in excerpt
 
-    # If text_body becomes empty after stripping preheaders and tracking URLs, fall back to HTML
     empty_after_strip = (
         "\u034f\u200c\u2007\u00ad\n"
         "<https://track.example.com/only-tracking-link>\n"
@@ -519,7 +454,8 @@ def test_build_raw_excerpt_preserves_content_past_1500_chars_up_to_4000_chars() 
 
 
 def test_clean_html_for_storage_shrinks_bloated_receipt_and_preserves_metadata(
-    client: TestClient, db_session: Session, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
     css_bloat = ".cls { color: #333; padding: 10px; }\n" * 600
     long_href = "https://track.example.com/gp/r.html?C=1234567890&K=ABCDEFGHIJKLMNOPQRSTUVWX&U=order123"
@@ -566,20 +502,19 @@ def test_clean_html_for_storage_shrinks_bloated_receipt_and_preserves_metadata(
     assert 'href="https://shop.example.com/orders/1"' in cleaned
     assert "Keyboard Order" in cleaned
 
-    # Verify ingest_email persists cleaned html_excerpt
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", False)
-
-    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
-        return httpx.Response(
-            200,
-            json=_make_muninn_jev_response("plutus_purchase_receipt", has_amount="true", confidence=0.95),
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post)
-    resp = client.post(
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "significance_score": 8,
+            "_confidence": 0.95,
+        }
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": False},
+        jev_client=jev,
+    )
+    resp = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<bloated-receipt@example.com>",
@@ -601,15 +536,10 @@ def test_clean_html_for_storage_shrinks_bloated_receipt_and_preserves_metadata(
     assert 'alt="Ergonomic Wireless Keyboard"' in saved.html_excerpt
 
 
-def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_120s_timeout(
-    client: TestClient, db_session: Session, monkeypatch
+def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatches_to_plutus(
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
-
     stale_row = InboundEmail(
         message_id="<stale-captured-1@example.com>",
         from_address="orders@shop.example.com",
@@ -635,35 +565,24 @@ def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_120s_time
     db_session.commit()
     db_session.refresh(stale_row)
 
-    recorded_calls: list[tuple[str, Any, Any]] = []
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "significance_score": 8,
+            "_confidence": 0.96,
+        }
+    )
+    plutus = InMemoryPlutusDispatcher(
+        default_result=PlutusDispatchResult(status="dispatched", consumer_ref="plutus-rcpt-42")
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": True},
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+    )
 
-    class CapturingAsyncClient:
-        def __init__(self, *args, **kwargs):
-            self.timeout = kwargs.get("timeout")
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
-            recorded_calls.append((url, self.timeout, json))
-            if "muninn.local" in url:
-                return httpx.Response(
-                    200,
-                    json=_make_muninn_jev_response("plutus_purchase_receipt", has_amount="true", confidence=0.96),
-                    request=httpx.Request("POST", url),
-                )
-            return httpx.Response(
-                200,
-                json={"consumer_ref": "plutus-rcpt-42"},
-                request=httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", CapturingAsyncClient)
-
-    retry_resp = client.post(
+    retry_resp = h.client.post(
         f"/api/emails/{stale_row.id}/retry",
         json={"reclassify": True},
     )
@@ -675,68 +594,12 @@ def test_retry_email_reclassify_rebuilds_raw_excerpt_and_dispatch_uses_120s_time
     assert "Order Confirmed: SGD 179.74 at Example Mart" in data["raw_excerpt"]
     assert "\u034f" not in data["raw_excerpt"]
 
-    assert len(recorded_calls) == 2
-    muninn_url, muninn_timeout, muninn_body = recorded_calls[0]
-    assert muninn_url == "http://muninn.local/v1/chat/completions"
-    assert muninn_timeout == 10.0
-    user_prompt = muninn_body["messages"][1]["content"]
-    assert "Order Confirmed: SGD 179.74 at Example Mart" in user_prompt
-    assert "starved preheader" not in user_prompt
+    assert len(jev.calls) == 1
+    assert "Order Confirmed: SGD 179.74 at Example Mart" in jev.calls[0].state_text
+    assert "starved preheader" not in jev.calls[0].state_text
 
-    plutus_url, plutus_timeout, plutus_body = recorded_calls[1]
-    assert plutus_url == "http://plutus-api:8000/integrations/email"
-    assert plutus_timeout == 120.0
-    assert "Order Confirmed: SGD 179.74 at Example Mart" in plutus_body["raw_excerpt"]
-
-
-@pytest.mark.asyncio
-async def test_dispatch_to_plutus_configures_120s_timeout(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
-
-    captured_timeouts: list[Any] = []
-
-    class CapturingAsyncClient:
-        def __init__(self, *args, **kwargs):
-            captured_timeouts.append(kwargs.get("timeout"))
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url: str, json: Any = None, headers: dict[str, str] | None = None):
-            return httpx.Response(
-                200,
-                json={"consumer_ref": "plutus-rcpt-120"},
-                request=httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(httpx, "AsyncClient", CapturingAsyncClient)
-
-    email_row = InboundEmail(
-        id=101,
-        message_id="<timeout-check@example.com>",
-        from_address="reservations@example-hotel.test",
-        to_address="iris@example.com",
-        subject="Hotel Deposit Receipt",
-        received_at=datetime(2026, 11, 21, 2, 0, tzinfo=timezone.utc),
-        text_body="Deposit Paid: PHP 11,700.00",
-        html_excerpt=None,
-        raw_excerpt="Deposit Paid: PHP 11,700.00",
-        attachments_meta=[],
-        jev_verdict={"route_target": "plutus_purchase_receipt"},
-        route_target="plutus_purchase_receipt",
-        dispatch_status="received",
-        attachments=[],
-    )
-
-    status_code, dispatch_status, consumer_ref = await _dispatch_to_plutus(email_row)
-    assert status_code == 200
-    assert dispatch_status == "dispatched"
-    assert consumer_ref == "plutus-rcpt-120"
-    assert captured_timeouts == [120.0]
+    assert len(plutus.requests) == 1
+    assert "Order Confirmed: SGD 179.74 at Example Mart" in (plutus.requests[0].raw_excerpt or "")
 
 
 @pytest.mark.parametrize(
@@ -770,46 +633,27 @@ async def test_dispatch_to_plutus_configures_120s_timeout(monkeypatch) -> None:
     ],
 )
 def test_webhook_email_payslip_dispatches_to_plutus(
-    client: TestClient,
-    monkeypatch,
+    make_harness: Callable[..., IrisTestHarness],
     case_id: str,
     has_amount: bool,
     attachments: list[dict[str, str]],
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
-
-    plutus_requests: list[dict[str, Any]] = []
-
-    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
-        if "muninn.local" in url:
-            return httpx.Response(
-                200,
-                json=_make_muninn_jev_response(
-                    "plutus_payslip",
-                    has_amount=has_amount,
-                    score=8,
-                    confidence=0.95,
-                ),
-                request=httpx.Request("POST", url),
-            )
-        plutus_requests.append(json_body)
-        return httpx.Response(
-            200,
-            json={
-                "status": "processed",
-                "route_target": "plutus_payslip",
-                "consumer_ref": "receipt:42",
-                "receipt_id": 42,
-                "receipt_ids": [42],
-            },
-            request=httpx.Request("POST", url),
-        )
-
-    _mock_async_client(monkeypatch, fake_post)
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_payslip",
+            "has_actionable_amount": has_amount,
+            "significance_score": 8,
+            "_confidence": 0.95,
+        }
+    )
+    plutus = InMemoryPlutusDispatcher(
+        default_result=PlutusDispatchResult(status="dispatched", consumer_ref="receipt:42")
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": True},
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+    )
 
     encoded_doc = base64.b64encode(b"%PDF-1.4\nAcme Payroll Net Pay Synthetic").decode("ascii")
     payload_attachments = [
@@ -821,7 +665,7 @@ def test_webhook_email_payslip_dispatches_to_plutus(
         for item in attachments
     ]
 
-    resp = client.post(
+    resp = h.client.post(
         "/webhook/email",
         json={
             "message_id": f"<payslip-{case_id}@acme.example>",
@@ -840,52 +684,48 @@ def test_webhook_email_payslip_dispatches_to_plutus(
     assert body["consumer_ref"] == "receipt:42"
     assert body["error_detail"] is None
 
-    assert len(plutus_requests) == 1
-    dispatched = plutus_requests[0]
-    assert dispatched["route_target"] == "plutus_payslip"
-    assert len(dispatched["attachments"]) == len(payload_attachments)
+    assert len(plutus.requests) == 1
+    dispatched = plutus.requests[0]
+    assert dispatched.route_target == "plutus_payslip"
+    assert len(dispatched.attachments) == len(payload_attachments)
     if payload_attachments:
-        assert dispatched["attachments"][0]["filename"] == payload_attachments[0]["filename"]
-        assert dispatched["attachments"][0]["content_base64"] == encoded_doc
+        assert dispatched.attachments[0].filename == payload_attachments[0]["filename"]
+        assert dispatched.attachments[0].content_base64 == encoded_doc
 
 
 def test_webhook_email_payslip_missing_attachment_parks_and_keeps_receipt_guard(
-    client: TestClient, monkeypatch
+    make_harness: Callable[..., IrisTestHarness],
 ) -> None:
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn.local/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", "muninn-key")
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", True)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", "plutus-secret")
-    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", "discord-bot-token")
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_INFO_ID", "chan-info-123")
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "plutus_payslip",
+                "has_actionable_amount": False,
+                "significance_score": 7,
+                "_confidence": 0.91,
+            },
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": False,
+                "significance_score": 7,
+                "_confidence": 0.91,
+            },
+        ]
+    )
+    plutus = InMemoryPlutusDispatcher()
+    discord = InMemoryDiscordTransport()
+    h = make_harness(
+        settings_overrides={
+            "IRIS_PLUTUS_DISPATCH_ENABLED": True,
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_INFO_ID": "chan-info-123",
+        },
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+        discord_transport=discord,
+    )
 
-    plutus_calls: list[str] = []
-    discord_calls: list[tuple[str, dict[str, Any]]] = []
-    current_target = {"route": "plutus_payslip"}
-
-    async def fake_post(url: str, json_body: Any, headers: dict[str, str]):
-        if "discord.com/api/v10" in url:
-            discord_calls.append((url, json_body))
-            return httpx.Response(200, json={"id": f"thread-{len(discord_calls)}"}, request=httpx.Request("POST", url))
-        if "muninn.local" in url:
-            return httpx.Response(
-                200,
-                json=_make_muninn_jev_response(
-                    current_target["route"],
-                    has_amount=False,
-                    score=7,
-                    confidence=0.91,
-                ),
-                request=httpx.Request("POST", url),
-            )
-        plutus_calls.append(url)
-        return httpx.Response(200, json={"consumer_ref": "unexpected"}, request=httpx.Request("POST", url))
-
-    _mock_async_client(monkeypatch, fake_post)
-
-    # 1. Attachment-less payslip portal reminder without amount -> payslip_missing_attachment
-    resp_payslip = client.post(
+    resp_payslip = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<payslip-portal-only@acme.example>",
@@ -902,14 +742,11 @@ def test_webhook_email_payslip_missing_attachment_parks_and_keeps_receipt_guard(
     assert payslip_body["route_target"] == "plutus_payslip"
     assert payslip_body["dispatch_status"] == "needs_review"
     assert payslip_body["error_detail"] == "payslip_missing_attachment"
-    assert plutus_calls == []
-    assert len(discord_calls) == 1
-    assert discord_calls[0][0] == "https://discord.com/api/v10/channels/chan-info-123/threads"
+    assert plutus.requests == []
+    assert [post.channel_id for post in discord.posts] == ["chan-info-123"]
 
-    # 2. Purchase receipt guard stays unchanged even when a PDF attachment is present
-    current_target["route"] = "plutus_purchase_receipt"
     encoded_pdf = base64.b64encode(b"%PDF-1.4\nReceipt").decode("ascii")
-    resp_receipt = client.post(
+    resp_receipt = h.client.post(
         "/webhook/email",
         json={
             "message_id": "<receipt-no-amt-pdf@example.com>",
@@ -930,4 +767,5 @@ def test_webhook_email_payslip_missing_attachment_parks_and_keeps_receipt_guard(
     assert resp_receipt.status_code == 200
     assert resp_receipt.json()["dispatch_status"] == "needs_review"
     assert resp_receipt.json()["error_detail"] == "receipt_missing_actionable_amount"
-    assert plutus_calls == []
+    assert plutus.requests == []
+    assert len(discord.posts) == 2

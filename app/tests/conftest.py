@@ -1,38 +1,72 @@
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterator, Optional
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.container import IrisContainer, build_container
+from app.core.config import Settings
 from app.db.session import dispose_engines, get_session_factory
-from app.main import app
+from app.inbound.ports import PlutusDispatchPort
+from app.jev import JevClientPort
+from app.main import create_app
+from app.tests.fakes import (
+    FakeClock,
+    InMemoryDiscordTransport,
+    InMemoryJevClient,
+    InMemoryPlutusDispatcher,
+    InMemorySesAdapter,
+)
+
+
+@dataclass
+class IrisTestHarness:
+    app: FastAPI
+    client: TestClient
+    container: IrisContainer
+    settings: Settings
+    jev: JevClientPort
+    plutus: PlutusDispatchPort
+    discord: InMemoryDiscordTransport
+    ses: InMemorySesAdapter
+    clock: FakeClock
+
+
+def build_test_settings(database_url: str, **overrides: Any) -> Settings:
+    defaults: dict[str, Any] = {
+        "_env_file": None,
+        "DATABASE_URL": database_url,
+        "IRIS_DB_PASSWORD": None,
+        "IRIS_WEBHOOK_SECRET": "test-iris-webhook-secret",
+        "ENV": "test",
+        "MUNINN_API_BASE": "http://muninn.local/v1",
+        "MUNINN_API_KEY": "muninn-key",
+        "MUNINN_JEV_MODEL": "jev-decision",
+        "DISCORD_BOT_TOKEN": None,
+        "DISCORD_CHANNEL_ALERT_ID": None,
+        "DISCORD_CHANNEL_INFO_ID": None,
+        "DISCORD_CHANNEL_HEALTH_ID": None,
+        "DISCORD_CHANNEL_WEALTH_ID": None,
+        "DISCORD_USER_ID": None,
+        "IRIS_PLUTUS_DISPATCH_ENABLED": False,
+        "PLUTUS_API_URL": "http://plutus-api:8000",
+        "PLUTUS_WEBHOOK_SECRET": "plutus-secret",
+        "IRIS_ALERT_CONFIDENCE_THRESHOLD": 0.80,
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
 
 
 @pytest.fixture()
-def isolated_db(tmp_path: Path, monkeypatch) -> Iterator[Path]:
+def isolated_db_url(tmp_path: Path) -> Iterator[str]:
     db_file = tmp_path / "iris_test.db"
     db_url = f"sqlite:///{db_file}"
-
-    monkeypatch.setattr(settings, "DATABASE_URL", db_url)
-    monkeypatch.setattr(settings, "IRIS_DB_PASSWORD", None)
-    monkeypatch.setattr(settings, "IRIS_WEBHOOK_SECRET", "test-iris-webhook-secret")
-    monkeypatch.setattr(settings, "ENV", "test")
-    monkeypatch.setattr(settings, "MUNINN_API_BASE", "http://muninn:4000/v1")
-    monkeypatch.setattr(settings, "MUNINN_API_KEY", None)
-    monkeypatch.setattr(settings, "MUNINN_JEV_MODEL", "jev-decision")
-    monkeypatch.setattr(settings, "DISCORD_BOT_TOKEN", None)
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_ALERT_ID", None)
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_INFO_ID", None)
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_HEALTH_ID", None)
-    monkeypatch.setattr(settings, "DISCORD_CHANNEL_WEALTH_ID", None)
-    monkeypatch.setattr(settings, "DISCORD_USER_ID", None)
-    monkeypatch.setattr(settings, "IRIS_PLUTUS_DISPATCH_ENABLED", False)
-    monkeypatch.setattr(settings, "PLUTUS_API_URL", "http://plutus-api:8000")
-    monkeypatch.setattr(settings, "PLUTUS_WEBHOOK_SECRET", None)
-    monkeypatch.setattr(settings, "IRIS_ALERT_CONFIDENCE_THRESHOLD", 0.80)
 
     dispose_engines()
 
@@ -42,14 +76,14 @@ def isolated_db(tmp_path: Path, monkeypatch) -> Iterator[Path]:
     alembic_command.upgrade(cfg, "head")
 
     try:
-        yield db_file
+        yield db_url
     finally:
         dispose_engines()
 
 
 @pytest.fixture()
-def db_session(isolated_db: Path):
-    factory = get_session_factory()
+def db_session(isolated_db_url: str) -> Iterator[Session]:
+    factory = get_session_factory(isolated_db_url)
     session = factory()
     try:
         yield session
@@ -58,6 +92,57 @@ def db_session(isolated_db: Path):
 
 
 @pytest.fixture()
-def client(isolated_db: Path) -> Iterator[TestClient]:
-    with TestClient(app) as test_client:
-        yield test_client
+def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness]]:
+    stack = ExitStack()
+
+    def _factory(
+        *,
+        settings_overrides: Optional[dict[str, Any]] = None,
+        jev_client: Optional[JevClientPort] = None,
+        plutus_dispatcher: Optional[PlutusDispatchPort] = None,
+        discord_transport: Optional[InMemoryDiscordTransport] = None,
+        ses_adapter: Optional[InMemorySesAdapter] = None,
+        clock: Optional[FakeClock] = None,
+    ) -> IrisTestHarness:
+        cfg = build_test_settings(isolated_db_url, **(settings_overrides or {}))
+        jev = jev_client if jev_client is not None else InMemoryJevClient()
+        plutus = plutus_dispatcher if plutus_dispatcher is not None else InMemoryPlutusDispatcher()
+        discord = discord_transport if discord_transport is not None else InMemoryDiscordTransport()
+        ses = ses_adapter if ses_adapter is not None else InMemorySesAdapter()
+        clk = clock if clock is not None else FakeClock()
+        container = build_container(
+            cfg,
+            ses_adapter=ses,
+            jev_client=jev,
+            discord_transport=discord,
+            clock=clk,
+            plutus_dispatcher=plutus,
+        )
+        test_app = create_app(container)
+        test_client = stack.enter_context(TestClient(test_app))
+        return IrisTestHarness(
+            app=test_app,
+            client=test_client,
+            container=container,
+            settings=cfg,
+            jev=jev,
+            plutus=plutus,
+            discord=discord,
+            ses=ses,
+            clock=clk,
+        )
+
+    try:
+        yield _factory
+    finally:
+        stack.close()
+
+
+@pytest.fixture()
+def harness(make_harness: Callable[..., IrisTestHarness]) -> IrisTestHarness:
+    return make_harness()
+
+
+@pytest.fixture()
+def client(harness: IrisTestHarness) -> TestClient:
+    return harness.client

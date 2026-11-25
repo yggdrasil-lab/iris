@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -596,3 +597,96 @@ async def test_http_discord_transport_adapter_forum_reply_404_and_text_channel_f
         "https://discord.com/api/v10/channels/text-chan-77/threads",
         "https://discord.com/api/v10/channels/text-chan-77/messages",
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_resolution_releases_lock_before_discord_io_and_operator_notice_is_best_effort() -> None:
+    lock_states_during_post: list[bool] = []
+
+    class LockInspectingDiscord(InMemoryDiscordTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.alerter_ref: Any = None
+
+        async def post_message(
+            self,
+            *,
+            bot_token: str,
+            channel_id: str,
+            thread_name: str,
+            message_payload: dict[str, Any],
+            thread_id: str | None = None,
+        ):
+            if self.alerter_ref is not None:
+                lock_states_during_post.append(self.alerter_ref._lock.locked())
+            await asyncio.sleep(0)
+            return await super().post_message(
+                bot_token=bot_token,
+                channel_id=channel_id,
+                thread_name=thread_name,
+                message_payload=message_payload,
+                thread_id=thread_id,
+            )
+
+    from app.alerting import AlertingConfig, OutboundAlerter
+    from app.models.schemas import DiscordAlertRequest
+
+    discord = LockInspectingDiscord()
+    alerter = OutboundAlerter(
+        config=AlertingConfig(
+            bot_token="bot-token-123",
+            alert_channel_id="ch-alert",
+            info_channel_id="ch-info",
+            health_channel_id="ch-health",
+            wealth_channel_id="ch-wealth",
+            default_user_id="user-1",
+        ),
+        discord=discord,
+        jev=InMemoryJevClient(),
+        clock=FakeClock(),
+    )
+    discord.alerter_ref = alerter
+
+    await alerter.send_alert(
+        DiscordAlertRequest(
+            service="charon",
+            title="Backup Check",
+            details="Running",
+            severity="error",
+            triage=False,
+        )
+    )
+    res = await alerter.send_alert(
+        DiscordAlertRequest(
+            service="charon",
+            title="Backup Check",
+            details="Recovered",
+            severity="info",
+            triage=False,
+        )
+    )
+    assert res["status"] == "resolved"
+    assert lock_states_during_post == [False, False]
+
+    broken_alerter = OutboundAlerter(
+        config=AlertingConfig(
+            bot_token=None,
+            alert_channel_id=None,
+            info_channel_id=None,
+            health_channel_id=None,
+            wealth_channel_id=None,
+            default_user_id=None,
+        ),
+        discord=InMemoryDiscordTransport(),
+        jev=InMemoryJevClient(),
+        clock=FakeClock(),
+    )
+    assert (
+        await broken_alerter.send_operator_notice(
+            service="iris-inbound",
+            bot_name="Iris Inbound Gateway",
+            title="Needs Review",
+            details="Operator check",
+        )
+        is None
+    )
