@@ -9,7 +9,7 @@ I am the central switchboard and notification gateway of your infrastructure. My
 ## Core Philosophy
 
 *   **Unified Input**: I am the single entry point for all notifications.
-*   **Smart Routing**: I choose the path that fits the priority—Email for logs, Chat for attention.
+*   **Smart Routing**: I choose the path that fits the priority: Email for logs, Chat for attention.
 
 ---
 
