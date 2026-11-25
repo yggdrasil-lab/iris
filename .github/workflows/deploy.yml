@@ -1,12 +1,64 @@
 name: Deploy Iris
 
 on:
+  pull_request:
+    branches: ["main"]
   push:
     branches: ["main"]
   workflow_dispatch:
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check zero em/en dashes
+        run: |
+          python3 -c '
+          import pathlib, subprocess, sys
+          exts = {".py", ".ts", ".tsx", ".js", ".yml", ".yaml", ".md", ".sh", ".css", ".html", ".conf"}
+          files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          bad = []
+          for rel in files:
+              p = pathlib.Path(rel)
+              if p.name != "Dockerfile" and p.suffix not in exts:
+                  continue
+              text = p.read_text(encoding="utf-8", errors="replace")
+              if "\u2014" in text or "\u2013" in text:
+                  bad.append(rel)
+          if bad:
+              print("Em/en dash found in:", bad, file=sys.stderr)
+              sys.exit(1)
+          '
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install backend dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Run backend tests
+        run: python -m pytest app/tests -v
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web frontend
+        run: cd web && npm ci && npm run build
+
   deploy:
+    needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, gaia]
     env:
       ENV: production
