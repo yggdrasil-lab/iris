@@ -17,7 +17,7 @@ import { EmailDetailModal } from './components/EmailDetailModal';
 import { EmailFiltersBar } from './components/EmailFiltersBar';
 import { EmailListRow } from './components/EmailListRow';
 import { useIrisEmails } from './hooks/useIrisEmails';
-import type { InboundEmailStatsResponse } from './types/email';
+import type { InboundEmailRead, InboundEmailStatsResponse } from './types/email';
 
 interface KpiTileSpec {
   id: string;
@@ -79,8 +79,7 @@ function buildSummaryItems(
 ): SummaryMetricItem[] {
   return KPI_TILE_SPECS.map((spec) => {
     const isActive = statusFilter === spec.filterValue;
-    const nextFilter =
-      spec.filterValue !== 'all' && isActive ? 'all' : spec.filterValue;
+    const nextFilter = spec.filterValue !== 'all' && isActive ? 'all' : spec.filterValue;
 
     return {
       id: spec.id,
@@ -98,35 +97,78 @@ function buildSummaryItems(
   });
 }
 
+interface AuditFeedBodyProps {
+  isLoading: boolean;
+  emails: InboundEmailRead[];
+  hasActiveFilters: boolean;
+  onResetFilters: () => void;
+  onSelectEmail: (id: number) => void;
+}
+
+const AuditFeedBody: React.FC<AuditFeedBodyProps> = ({
+  isLoading,
+  emails,
+  hasActiveFilters,
+  onResetFilters,
+  onSelectEmail,
+}) => {
+  if (isLoading) {
+    return <LoadingState label="Loading inbound email ledger..." variant="blue" />;
+  }
+  if (emails.length === 0) {
+    return (
+      <EmptyState
+        icon={<Inbox className="w-8 h-8" />}
+        title="No matching inbound emails"
+        description="Adjust your status, route target, or search filters, or forward a message to Iris to populate the audit feed."
+        action={
+          hasActiveFilters ? (
+            <Button variant="secondary" size="sm" className="min-h-[44px]" onClick={onResetFilters}>
+              Clear Filters
+            </Button>
+          ) : undefined
+        }
+      />
+    );
+  }
+  return (
+    <div className="space-y-3 min-w-0">
+      {emails.map((email) => (
+        <EmailListRow key={email.id} email={email} onSelect={onSelectEmail} />
+      ))}
+    </div>
+  );
+};
+
 export const App: React.FC = () => {
   const iris = useIrisEmails();
   const hasActiveFilters =
     iris.statusFilter !== 'all' ||
     iris.routeTargetFilter !== 'all' ||
     iris.searchInput.trim() !== '';
+  const summaryItems = buildSummaryItems(iris.stats, iris.statusFilter, iris.setStatusFilter);
 
-  const summaryItems = buildSummaryItems(
-    iris.stats,
-    iris.statusFilter,
-    iris.setStatusFilter,
-  );
-
-  const header = (
-    <AppHeader
-      variant="blue"
-      title="Iris Gateway"
-      subtitle="Inbound Email Audit & Routing"
-      brandIcon={<Mail className="w-4 h-4" />}
-      onRefresh={() => void iris.refreshAll()}
-      isRefreshing={iris.isRefreshing}
-    />
-  );
+  const resetFilters = () => {
+    iris.setStatusFilter('all');
+    iris.setRouteTargetFilter('all');
+    iris.setSearchInput('');
+  };
 
   return (
-    <AppShell header={header}>
+    <AppShell
+      header={
+        <AppHeader
+          variant="blue"
+          title="Iris Gateway"
+          subtitle="Inbound Email Audit & Routing"
+          brandIcon={<Mail className="w-4 h-4" />}
+          onRefresh={() => void iris.refreshAll()}
+          isRefreshing={iris.isRefreshing}
+        />
+      }
+    >
       <div className="space-y-4 min-w-0">
         {iris.sessionExpired && <SessionExpiredBanner />}
-
         {Boolean(iris.error) && (
           <AlertBanner
             variant="error"
@@ -157,41 +199,13 @@ export const App: React.FC = () => {
           onRouteTargetChange={iris.setRouteTargetFilter}
         />
 
-        {iris.isLoading ? (
-          <LoadingState label="Loading inbound email ledger..." variant="blue" />
-        ) : iris.emails.length === 0 ? (
-          <EmptyState
-            icon={<Inbox className="w-8 h-8" />}
-            title="No matching inbound emails"
-            description="Adjust your status, route target, or search filters, or forward a message to Iris to populate the audit feed."
-            action={
-              hasActiveFilters ? (
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="min-h-[44px]"
-                  onClick={() => {
-                    iris.setStatusFilter('all');
-                    iris.setRouteTargetFilter('all');
-                    iris.setSearchInput('');
-                  }}
-                >
-                  Clear Filters
-                </Button>
-              ) : undefined
-            }
-          />
-        ) : (
-          <div className="space-y-3 min-w-0">
-            {iris.emails.map((email) => (
-              <EmailListRow
-                key={email.id}
-                email={email}
-                onSelect={(id) => void iris.openEmailDetail(id)}
-              />
-            ))}
-          </div>
-        )}
+        <AuditFeedBody
+          isLoading={iris.isLoading}
+          emails={iris.emails}
+          hasActiveFilters={hasActiveFilters}
+          onResetFilters={resetFilters}
+          onSelectEmail={(id) => void iris.openEmailDetail(id)}
+        />
 
         <PaginationBar
           page={iris.page}

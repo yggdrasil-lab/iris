@@ -9,139 +9,137 @@ export interface MockApiOptions {
   failInitialLoad?: boolean;
 }
 
-function buildFixtureEmails(): InboundEmailDetailResponse[] {
-  return [
-    {
-      id: 101,
-      message_id: '<msg-101@example.com>',
-      from_address: 'alerts@pacificbank.example',
-      to_address: 'iris-gateway@example.net',
-      subject: 'Card Purchase Alert: Harbour Fresh Market NZD 42.50',
-      received_at: '2026-11-24T22:15:00Z',
-      raw_excerpt: 'You spent NZD 42.50 at Harbour Fresh Market using card ending 1001.',
-      attachments_meta: [],
-      jev_verdict: {
-        route_target: 'plutus_dbs_alert',
-        has_actionable_amount: true,
-        confidence: 0.96,
-        urgency_score: 0.4,
-        reason: 'Synthetic card purchase alert matching bank alert template.',
-        provider: 'muninn-jev',
-      },
+const FIXTURE_EMAILS: InboundEmailDetailResponse[] = [
+  {
+    id: 101,
+    message_id: '<msg-101@example.com>',
+    from_address: 'alerts@pacificbank.example',
+    to_address: 'iris-gateway@example.net',
+    subject: 'Card Purchase Alert: Harbour Fresh Market NZD 42.50',
+    received_at: '2026-11-24T22:15:00Z',
+    raw_excerpt: 'You spent NZD 42.50 at Harbour Fresh Market using card ending 1001.',
+    attachments_meta: [],
+    jev_verdict: {
       route_target: 'plutus_dbs_alert',
-      dispatch_status: 'dispatched',
-      consumer_ref: 'plutus-tx-9001',
-      error_detail: null,
-      retry_count: 0,
-      created_at: '2026-11-24T22:15:02Z',
-      updated_at: '2026-11-24T22:15:05Z',
-      text_body: 'Transaction Alert: NZD 42.50 at Harbour Fresh Market on card ending 1001.',
-      html_excerpt: '<p>Transaction Alert: NZD 42.50 at Harbour Fresh Market.</p>',
-      attachments: [],
+      has_actionable_amount: true,
+      confidence: 0.96,
+      urgency_score: 0.4,
+      reason: 'Synthetic card purchase alert matching bank alert template.',
+      provider: 'muninn-jev',
     },
-    {
-      id: 102,
-      message_id: '<msg-102@example.com>',
-      from_address: 'Alex Tan <alex.tan@example.com>',
-      to_address: 'iris-gateway@example.net',
-      subject: 'Invoice #2048 - Northwind Hardware Supply',
-      received_at: '2026-11-24T21:40:00Z',
-      raw_excerpt: 'Please find attached receipt #2048 for NZD 189.00.',
-      attachments_meta: [
-        {
-          filename: 'invoice-2048.pdf',
-          content_type: 'application/pdf',
-          size_bytes: 24576,
-          sha256: 'abc123def4567890abcdef1234567890',
-        },
-      ],
-      jev_verdict: {
-        route_target: 'plutus_purchase_receipt',
-        has_actionable_amount: true,
-        confidence: 0.72,
-        urgency_score: 0.55,
-        reason: 'Low confidence threshold requires operator confirmation.',
-        provider: 'muninn-jev',
+    route_target: 'plutus_dbs_alert',
+    dispatch_status: 'dispatched',
+    consumer_ref: 'plutus-tx-9001',
+    error_detail: null,
+    retry_count: 0,
+    created_at: '2026-11-24T22:15:02Z',
+    updated_at: '2026-11-24T22:15:05Z',
+    text_body: 'Transaction Alert: NZD 42.50 at Harbour Fresh Market on card ending 1001.',
+    html_excerpt: '<p>Transaction Alert: NZD 42.50 at Harbour Fresh Market.</p>',
+    attachments: [],
+  },
+  {
+    id: 102,
+    message_id: '<msg-102@example.com>',
+    from_address: 'Alex Tan <alex.tan@example.com>',
+    to_address: 'iris-gateway@example.net',
+    subject: 'Invoice #2048 - Northwind Hardware Supply',
+    received_at: '2026-11-24T21:40:00Z',
+    raw_excerpt: 'Please find attached receipt #2048 for NZD 189.00.',
+    attachments_meta: [
+      {
+        filename: 'invoice-2048.pdf',
+        content_type: 'application/pdf',
+        size_bytes: 24576,
+        sha256: 'abc123def4567890abcdef1234567890',
       },
+    ],
+    jev_verdict: {
       route_target: 'plutus_purchase_receipt',
-      dispatch_status: 'needs_review',
-      consumer_ref: null,
-      error_detail: null,
-      retry_count: 0,
-      created_at: '2026-11-24T21:40:03Z',
-      updated_at: '2026-11-24T21:40:03Z',
-      text_body: 'Hi, attached is invoice #2048 from Northwind Hardware Supply for NZD 189.00.',
-      html_excerpt: null,
-      attachments: [
-        {
-          id: 1,
-          filename: 'invoice-2048.pdf',
-          content_type: 'application/pdf',
-          size_bytes: 24576,
-          sha256: 'abc123def4567890abcdef1234567890',
-          content_base64: 'JVBERi0xLjQK',
-          created_at: '2026-11-24T21:40:03Z',
-        },
-      ],
+      has_actionable_amount: true,
+      confidence: 0.72,
+      urgency_score: 0.55,
+      reason: 'Low confidence threshold requires operator confirmation.',
+      provider: 'muninn-jev',
     },
-    {
-      id: 103,
-      message_id: '<msg-103@example.com>',
-      from_address: 'payroll@northwind.example',
-      to_address: 'iris-gateway@example.net',
-      subject: 'Monthly Payslip - November 2026',
-      received_at: '2026-11-24T20:10:00Z',
-      raw_excerpt: 'Your November 2026 payslip statement is ready.',
-      attachments_meta: [],
-      jev_verdict: {
-        route_target: 'plutus_payslip',
-        has_actionable_amount: false,
-        confidence: 0.89,
-        urgency_score: 0.3,
-        reason: 'Payroll delivery failed downstream timeout.',
-        provider: 'muninn-jev',
+    route_target: 'plutus_purchase_receipt',
+    dispatch_status: 'needs_review',
+    consumer_ref: null,
+    error_detail: null,
+    retry_count: 0,
+    created_at: '2026-11-24T21:40:03Z',
+    updated_at: '2026-11-24T21:40:03Z',
+    text_body: 'Hi, attached is invoice #2048 from Northwind Hardware Supply for NZD 189.00.',
+    html_excerpt: null,
+    attachments: [
+      {
+        id: 1,
+        filename: 'invoice-2048.pdf',
+        content_type: 'application/pdf',
+        size_bytes: 24576,
+        sha256: 'abc123def4567890abcdef1234567890',
+        content_base64: 'JVBERi0xLjQK',
+        created_at: '2026-11-24T21:40:03Z',
       },
+    ],
+  },
+  {
+    id: 103,
+    message_id: '<msg-103@example.com>',
+    from_address: 'payroll@northwind.example',
+    to_address: 'iris-gateway@example.net',
+    subject: 'Monthly Payslip - November 2026',
+    received_at: '2026-11-24T20:10:00Z',
+    raw_excerpt: 'Your November 2026 payslip statement is ready.',
+    attachments_meta: [],
+    jev_verdict: {
       route_target: 'plutus_payslip',
-      dispatch_status: 'failed',
-      consumer_ref: null,
-      error_detail: 'Downstream consumer returned HTTP 503 Service Unavailable',
-      retry_count: 2,
-      created_at: '2026-11-24T20:10:01Z',
-      updated_at: '2026-11-24T20:12:00Z',
-      text_body: 'Your November 2026 payslip statement is enclosed.',
-      html_excerpt: null,
-      attachments: [],
+      has_actionable_amount: false,
+      confidence: 0.89,
+      urgency_score: 0.3,
+      reason: 'Payroll delivery failed downstream timeout.',
+      provider: 'muninn-jev',
     },
-    {
-      id: 104,
-      message_id: '<msg-104@example.com>',
-      from_address: 'noreply@example.com',
-      to_address: 'iris-gateway@example.net',
-      subject: 'Weekly Digest Newsletter',
-      received_at: '2026-11-24T18:00:00Z',
-      raw_excerpt: 'Top stories from this week.',
-      attachments_meta: [],
-      jev_verdict: {
-        route_target: 'ignore',
-        has_actionable_amount: false,
-        confidence: 0.99,
-        urgency_score: 0.05,
-        reason: 'Marketing newsletter classified as ignore.',
-        provider: 'muninn-jev',
-      },
+    route_target: 'plutus_payslip',
+    dispatch_status: 'failed',
+    consumer_ref: null,
+    error_detail: 'Downstream consumer returned HTTP 503 Service Unavailable',
+    retry_count: 2,
+    created_at: '2026-11-24T20:10:01Z',
+    updated_at: '2026-11-24T20:12:00Z',
+    text_body: 'Your November 2026 payslip statement is enclosed.',
+    html_excerpt: null,
+    attachments: [],
+  },
+  {
+    id: 104,
+    message_id: '<msg-104@example.com>',
+    from_address: 'noreply@example.com',
+    to_address: 'iris-gateway@example.net',
+    subject: 'Weekly Digest Newsletter',
+    received_at: '2026-11-24T18:00:00Z',
+    raw_excerpt: 'Top stories from this week.',
+    attachments_meta: [],
+    jev_verdict: {
       route_target: 'ignore',
-      dispatch_status: 'ignored',
-      consumer_ref: null,
-      error_detail: null,
-      retry_count: 0,
-      created_at: '2026-11-24T18:00:01Z',
-      updated_at: '2026-11-24T18:00:02Z',
-      text_body: 'Top stories from this week.',
-      html_excerpt: null,
-      attachments: [],
+      has_actionable_amount: false,
+      confidence: 0.99,
+      urgency_score: 0.05,
+      reason: 'Marketing newsletter classified as ignore.',
+      provider: 'muninn-jev',
     },
-  ];
-}
+    route_target: 'ignore',
+    dispatch_status: 'ignored',
+    consumer_ref: null,
+    error_detail: null,
+    retry_count: 0,
+    created_at: '2026-11-24T18:00:01Z',
+    updated_at: '2026-11-24T18:00:02Z',
+    text_body: 'Top stories from this week.',
+    html_excerpt: null,
+    attachments: [],
+  },
+];
 
 function computeStats(items: InboundEmailDetailResponse[]): InboundEmailStatsResponse {
   const byStatus: Record<string, number> = {};
@@ -165,12 +163,7 @@ function filterEmails(
     if (status && status !== 'all' && item.dispatch_status !== status) return false;
     if (routeTarget && routeTarget !== 'all' && item.route_target !== routeTarget) return false;
     if (!query) return true;
-    const haystack = [
-      item.subject,
-      item.from_address,
-      item.message_id,
-      item.raw_excerpt || '',
-    ]
+    const haystack = [item.subject, item.from_address, item.message_id, item.raw_excerpt || '']
       .join(' ')
       .toLowerCase();
     return haystack.includes(query);
@@ -205,19 +198,13 @@ async function handleActionRoute(
   await route.fulfill({ status: 200, json: target });
 }
 
-export async function setupMockApi(
+async function registerListRoutes(
   page: Page,
-  options: MockApiOptions = {},
-): Promise<{ emails: InboundEmailDetailResponse[] }> {
-  const emails = options.empty ? [] : buildFixtureEmails();
-  let shouldFail = Boolean(options.failInitialLoad);
-
-  await page.route('**/api/client-errors', async (route) => {
-    await route.fulfill({ status: 200, json: { status: 'ok' } });
-  });
-
+  emails: InboundEmailDetailResponse[],
+  failState: { fail: boolean },
+): Promise<void> {
   await page.route('**/api/emails/stats', async (route) => {
-    if (shouldFail) {
+    if (failState.fail) {
       await route.fulfill({ status: 500, json: { detail: 'Simulated stats outage' } });
       return;
     }
@@ -225,8 +212,8 @@ export async function setupMockApi(
   });
 
   await page.route(/\/api\/emails(\?.*)?$/, async (route) => {
-    if (shouldFail) {
-      shouldFail = false;
+    if (failState.fail) {
+      failState.fail = false;
       await route.fulfill({ status: 500, json: { detail: 'Simulated audit feed outage' } });
       return;
     }
@@ -246,7 +233,12 @@ export async function setupMockApi(
       },
     });
   });
+}
 
+async function registerDetailRoutes(
+  page: Page,
+  emails: InboundEmailDetailResponse[],
+): Promise<void> {
   await page.route(/\/api\/emails\/(\d+)(\/(retry|reroute|ignore))?$/, async (route) => {
     const match = route.request().url().match(/\/api\/emails\/(\d+)(?:\/(retry|reroute|ignore))?$/);
     if (!match) {
@@ -264,6 +256,20 @@ export async function setupMockApi(
       found ? { status: 200, json: found } : { status: 404, json: { detail: 'Email not found' } },
     );
   });
+}
+
+export async function setupMockApi(
+  page: Page,
+  options: MockApiOptions = {},
+): Promise<{ emails: InboundEmailDetailResponse[] }> {
+  const emails = options.empty ? [] : structuredClone(FIXTURE_EMAILS);
+  const failState = { fail: Boolean(options.failInitialLoad) };
+
+  await page.route('**/api/client-errors', async (route) => {
+    await route.fulfill({ status: 200, json: { status: 'ok' } });
+  });
+  await registerListRoutes(page, emails, failState);
+  await registerDetailRoutes(page, emails);
 
   return { emails };
 }

@@ -20,44 +20,24 @@ export type EmailActionKind = 'retry' | 'reclassify' | 'reroute' | 'ignore' | nu
 
 const PAGE_SIZE = 25;
 
-function useEmailDetailActions(
-  refreshAll: () => Promise<void>,
-  setSessionExpired: (expired: boolean) => void,
-) {
-  const [isDetailOpen, setIsDetailOpen] = useState<boolean>(false);
-  const [selectedEmail, setSelectedEmail] = useState<InboundEmailDetailResponse | null>(null);
-  const [isDetailLoading, setIsDetailLoading] = useState<boolean>(false);
-  const [actionLoading, setActionLoading] = useState<EmailActionKind>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+interface MutationHandlersParams {
+  refreshAll: () => Promise<void>;
+  setSessionExpired: (expired: boolean) => void;
+  setIsDetailOpen: (open: boolean) => void;
+  setSelectedEmail: (email: InboundEmailDetailResponse | null) => void;
+  setActionLoading: (kind: EmailActionKind) => void;
+  setActionError: (msg: string | null) => void;
+}
 
-  const openEmailDetail = useCallback(async (id: number) => {
-    setIsDetailOpen(true);
-    setIsDetailLoading(true);
-    setActionError(null);
-    setSelectedEmail(null);
-    try {
-      const detail = await fetchEmailDetail(id);
-      setSelectedEmail(detail);
-      setSessionExpired(false);
-    } catch (err) {
-      if (isSessionExpiredError(err)) {
-        setSessionExpired(true);
-        setIsDetailOpen(false);
-      } else {
-        setActionError(err instanceof Error ? err.message : 'Failed to load email detail');
-      }
-    } finally {
-      setIsDetailLoading(false);
-    }
-  }, [setSessionExpired]);
-
-  const closeEmailDetail = useCallback(() => {
-    if (actionLoading !== null) return;
-    setIsDetailOpen(false);
-    setActionError(null);
-  }, [actionLoading]);
-
-  const runMutation = useCallback(
+function useDetailMutationRunner({
+  refreshAll,
+  setSessionExpired,
+  setIsDetailOpen,
+  setSelectedEmail,
+  setActionLoading,
+  setActionError,
+}: MutationHandlersParams) {
+  return useCallback(
     async (kind: EmailActionKind, task: () => Promise<InboundEmailDetailResponse>) => {
       setActionLoading(kind);
       setActionError(null);
@@ -83,8 +63,54 @@ function useEmailDetailActions(
         setActionLoading(null);
       }
     },
-    [refreshAll, setSessionExpired],
+    [refreshAll, setActionError, setActionLoading, setIsDetailOpen, setSelectedEmail, setSessionExpired],
   );
+}
+
+function useEmailDetailActions(
+  refreshAll: () => Promise<void>,
+  setSessionExpired: (expired: boolean) => void,
+) {
+  const [isDetailOpen, setIsDetailOpen] = useState<boolean>(false);
+  const [selectedEmail, setSelectedEmail] = useState<InboundEmailDetailResponse | null>(null);
+  const [isDetailLoading, setIsDetailLoading] = useState<boolean>(false);
+  const [actionLoading, setActionLoading] = useState<EmailActionKind>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const runMutation = useDetailMutationRunner({
+    refreshAll,
+    setSessionExpired,
+    setIsDetailOpen,
+    setSelectedEmail,
+    setActionLoading,
+    setActionError,
+  });
+
+  const openEmailDetail = useCallback(async (id: number) => {
+    setIsDetailOpen(true);
+    setIsDetailLoading(true);
+    setActionError(null);
+    setSelectedEmail(null);
+    try {
+      setSelectedEmail(await fetchEmailDetail(id));
+      setSessionExpired(false);
+    } catch (err) {
+      if (isSessionExpiredError(err)) {
+        setSessionExpired(true);
+        setIsDetailOpen(false);
+      } else {
+        setActionError(err instanceof Error ? err.message : 'Failed to load email detail');
+      }
+    } finally {
+      setIsDetailLoading(false);
+    }
+  }, [setSessionExpired]);
+
+  const closeEmailDetail = useCallback(() => {
+    if (actionLoading !== null) return;
+    setIsDetailOpen(false);
+    setActionError(null);
+  }, [actionLoading]);
 
   const handleRetry = useCallback(
     (id: number, reclassify: boolean) =>
@@ -117,23 +143,12 @@ function useEmailDetailActions(
   };
 }
 
-export function useIrisEmails() {
-  const [stats, setStats] = useState<InboundEmailStatsResponse | null>(null);
-  const [emails, setEmails] = useState<InboundEmailRead[]>([]);
-  const [total, setTotal] = useState<number>(0);
+function useEmailFeedFilters() {
   const [page, setPage] = useState<number>(1);
   const [statusFilter, setStatusFilterState] = useState<string>('all');
   const [routeTargetFilter, setRouteTargetFilterState] = useState<string>('all');
   const [searchInput, setSearchInput] = useState<string>('');
   const debouncedQuery = useDebouncedValue(searchInput, 250);
-
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const [sessionExpired, setSessionExpired] = useState<boolean>(false);
-
-  const hasLoadedOnceRef = useRef<boolean>(false);
-  const prevDebouncedQueryRef = useRef<string>(debouncedQuery);
 
   const setStatusFilter = useCallback((nextStatus: string) => {
     setStatusFilterState(nextStatus);
@@ -145,22 +160,45 @@ export function useIrisEmails() {
     setPage(1);
   }, []);
 
+  return {
+    page,
+    setPage,
+    statusFilter,
+    setStatusFilter,
+    routeTargetFilter,
+    setRouteTargetFilter,
+    searchInput,
+    setSearchInput,
+    debouncedQuery,
+  };
+}
+
+export function useIrisEmails() {
+  const filters = useEmailFeedFilters();
+  const [stats, setStats] = useState<InboundEmailStatsResponse | null>(null);
+  const [emails, setEmails] = useState<InboundEmailRead[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [sessionExpired, setSessionExpired] = useState<boolean>(false);
+
+  const hasLoadedOnceRef = useRef<boolean>(false);
+  const prevDebouncedQueryRef = useRef<string>(filters.debouncedQuery);
+
   const refreshAll = useCallback(async () => {
-    if (!hasLoadedOnceRef.current) {
-      setIsLoading(true);
-    } else {
-      setIsRefreshing(true);
-    }
+    if (!hasLoadedOnceRef.current) setIsLoading(true);
+    else setIsRefreshing(true);
     setError(null);
 
     try {
       const [statsRes, listRes] = await Promise.all([
         fetchEmailStats(),
         fetchEmails({
-          status: statusFilter,
-          route_target: routeTargetFilter,
-          q: debouncedQuery,
-          page,
+          status: filters.statusFilter,
+          route_target: filters.routeTargetFilter,
+          q: filters.debouncedQuery,
+          page: filters.page,
           page_size: PAGE_SIZE,
         }),
       ]);
@@ -170,27 +208,24 @@ export function useIrisEmails() {
       setSessionExpired(false);
       hasLoadedOnceRef.current = true;
     } catch (err) {
-      if (isSessionExpiredError(err)) {
-        setSessionExpired(true);
-      } else {
-        setError(err instanceof Error ? err.message : 'Failed to load inbound emails');
-      }
+      if (isSessionExpiredError(err)) setSessionExpired(true);
+      else setError(err instanceof Error ? err.message : 'Failed to load inbound emails');
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
     }
-  }, [statusFilter, routeTargetFilter, debouncedQuery, page]);
+  }, [filters.statusFilter, filters.routeTargetFilter, filters.debouncedQuery, filters.page]);
 
   useEffect(() => {
-    if (prevDebouncedQueryRef.current !== debouncedQuery) {
-      prevDebouncedQueryRef.current = debouncedQuery;
-      if (page !== 1) {
-        setPage(1);
+    if (prevDebouncedQueryRef.current !== filters.debouncedQuery) {
+      prevDebouncedQueryRef.current = filters.debouncedQuery;
+      if (filters.page !== 1) {
+        filters.setPage(1);
         return;
       }
     }
     void refreshAll();
-  }, [debouncedQuery, page, refreshAll]);
+  }, [filters.debouncedQuery, filters.page, filters.setPage, refreshAll]);
 
   const detailActions = useEmailDetailActions(refreshAll, setSessionExpired);
 
@@ -198,15 +233,8 @@ export function useIrisEmails() {
     stats,
     emails,
     total,
-    page,
     pageSize: PAGE_SIZE,
-    setPage,
-    statusFilter,
-    setStatusFilter,
-    routeTargetFilter,
-    setRouteTargetFilter,
-    searchInput,
-    setSearchInput,
+    ...filters,
     isLoading,
     isRefreshing,
     error,
