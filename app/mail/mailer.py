@@ -82,11 +82,11 @@ class OutboundMailer:
         self._config = config
         self._ses = ses
 
-    def _require_default_sender(self) -> str:
-        default_sender = (self._config.default_sender or "").strip()
-        if not default_sender:
+    def _require_sender(self, sender: Optional[str] = None) -> str:
+        resolved = (sender or self._config.default_sender or "").strip()
+        if not resolved:
             raise MailConfigError("EMAIL_SENDER is not configured")
-        return default_sender
+        return resolved
 
     def send(
         self,
@@ -97,9 +97,7 @@ class OutboundMailer:
         sender: Optional[str] = None,
         reply_to: Optional[list[str]] = None,
     ) -> MailSendResult:
-        resolved_sender = (sender or self._config.default_sender or "").strip()
-        if not resolved_sender:
-            raise MailConfigError("EMAIL_SENDER is not configured")
+        resolved_sender = self._require_sender(sender)
 
         resolved_subject = subject or "No Subject"
         if self._config.env:
@@ -125,7 +123,7 @@ class OutboundMailer:
         self,
         mail_from: Optional[str],
     ) -> tuple[str, Optional[list[str]]]:
-        default_sender = self._require_default_sender()
+        default_sender = self._require_sender()
         verified_domain = (
             default_sender.split("@")[-1].lower() if "@" in default_sender else ""
         )

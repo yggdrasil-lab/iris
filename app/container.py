@@ -11,7 +11,7 @@ from app.mail import (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class IrisContainer:
     settings: Settings
     mailer: OutboundMailer
