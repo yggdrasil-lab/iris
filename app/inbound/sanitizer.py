@@ -286,3 +286,18 @@ def has_document_attachment(attachments_meta: Optional[List[Dict[str, Any]]]) ->
         if mime_type == "application/pdf" or mime_type.startswith("image/") or filename.endswith(".pdf"):
             return True
     return False
+
+
+def has_calendar_attachment(attachments_meta: Optional[List[Dict[str, Any]]]) -> bool:
+    """Return True when attachments metadata includes an .ics file or text/calendar part."""
+    if not attachments_meta:
+        return False
+    for att in attachments_meta:
+        if not isinstance(att, dict):
+            continue
+        raw_content_type = str(att.get("content_type") or "").strip().lower()
+        mime_type = raw_content_type.split(";", 1)[0].strip()
+        filename = str(att.get("filename") or "").strip().lower()
+        if mime_type == "text/calendar" or filename.endswith(".ics"):
+            return True
+    return False

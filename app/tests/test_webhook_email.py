@@ -8,10 +8,12 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.db.models import InboundEmail, InboundEmailAttachment
 from app.inbound import (
     MAX_RAW_EXCERPT_CHARS,
     MAX_STORED_BODY_CHARS,
+    ConsumerDispatchResult,
     PlutusDispatchResult,
     build_raw_excerpt,
     clean_html_for_storage,
@@ -19,7 +21,12 @@ from app.inbound import (
 )
 from app.jev import JevConfig, JevRouterUnavailableError, MuninnJevAdapter
 from app.tests.conftest import IrisTestHarness
-from app.tests.fakes import InMemoryDiscordTransport, InMemoryJevClient, InMemoryPlutusDispatcher
+from app.tests.fakes import (
+    InMemoryConsumerDispatcher,
+    InMemoryDiscordTransport,
+    InMemoryJevClient,
+    InMemoryPlutusDispatcher,
+)
 
 
 def test_webhook_email_auth_fail_closed_and_401(
@@ -769,3 +776,207 @@ def test_webhook_email_payslip_missing_attachment_parks_and_keeps_receipt_guard(
     assert resp_receipt.json()["error_detail"] == "receipt_missing_actionable_amount"
     assert plutus.requests == []
     assert len(discord.posts) == 2
+
+
+def test_webhook_email_chronos_only_and_ics_deterministic_trigger(
+    make_harness: Callable[..., IrisTestHarness],
+) -> None:
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "actionable_notice",
+                "has_actionable_amount": False,
+                "has_schedule_event": True,
+                "significance_score": 6,
+                "_confidence": 0.93,
+            },
+            {
+                "route_target": "ignore",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "significance_score": 2,
+                "_confidence": 0.91,
+            },
+        ]
+    )
+    plutus = InMemoryPlutusDispatcher()
+    chronos = InMemoryConsumerDispatcher(
+        responses=[
+            ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-101"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-102"),
+        ]
+    )
+    discord = InMemoryDiscordTransport()
+    h = make_harness(
+        settings_overrides={
+            "IRIS_PLUTUS_DISPATCH_ENABLED": True,
+            "IRIS_CHRONOS_DISPATCH_ENABLED": True,
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_INFO_ID": "chan-info-123",
+            "DISCORD_CHANNEL_ALERT_ID": "chan-alert-456",
+        },
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+        chronos_dispatcher=chronos,
+        discord_transport=discord,
+    )
+
+    resp_dentist = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<dentist-checkup@example.com>",
+            "from_address": "bookings@dental.example",
+            "to_address": "iris@example.com",
+            "subject": "Dentist Checkup",
+            "text_body": "Reminder for Alex Tan: Dentist Checkup on 2026-12-03 at 14:30.",
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert resp_dentist.status_code == 200
+    dentist_body = resp_dentist.json()
+    assert dentist_body["dispatch_status"] == "dispatched"
+    assert dentist_body["consumer_ref"] == "chronos-evt-101"
+    assert len(dentist_body["deliveries"]) == 1
+    assert dentist_body["deliveries"][0]["consumer"] == "chronos"
+    assert dentist_body["deliveries"][0]["dispatch_status"] == "dispatched"
+    assert plutus.requests == []
+    assert len(chronos.requests) == 1
+    assert discord.posts == []
+
+    encoded_ics = base64.b64encode(
+        b"BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nSUMMARY:Dentist Checkup\nEND:VEVENT\nEND:VCALENDAR"
+    ).decode("ascii")
+    resp_ics = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<ics-invite@example.com>",
+            "from_address": "calendar@example.org",
+            "to_address": "iris@example.com",
+            "subject": "Calendar Invite",
+            "text_body": "See attached invite.",
+            "attachments": [
+                {
+                    "filename": "invite.ics",
+                    "content_type": "text/calendar; method=REQUEST",
+                    "content_base64": encoded_ics,
+                }
+            ],
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert resp_ics.status_code == 200
+    ics_body = resp_ics.json()
+    assert ics_body["dispatch_status"] == "dispatched"
+    assert ics_body["jev_verdict"]["has_schedule_event"] is True
+    assert ics_body["consumer_ref"] == "chronos-evt-102"
+    assert len(chronos.requests) == 2
+    assert chronos.requests[1].attachments[0].filename == "invite.ics"
+    assert plutus.requests == []
+
+
+def test_webhook_email_dual_match_and_422_vs_503_handling(
+    make_harness: Callable[..., IrisTestHarness],
+) -> None:
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "has_schedule_event": True,
+            "significance_score": 8,
+            "_question_confidence": {
+                "route_target": 0.95,
+                "has_actionable_amount": 0.93,
+                "has_schedule_event": 0.92,
+            },
+        }
+    )
+    plutus = InMemoryPlutusDispatcher(
+        responses=[
+            ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-502"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-422"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-503"),
+        ]
+    )
+    chronos = InMemoryConsumerDispatcher(
+        responses=[
+            ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-502"),
+            ConsumerDispatchResult(status="rejected", error_detail="chronos_validation_422: bad date"),
+            ConsumerDispatchResult(status="unavailable", error_detail="chronos_upstream_503: down"),
+        ]
+    )
+    discord = InMemoryDiscordTransport()
+    h = make_harness(
+        settings_overrides={
+            "IRIS_PLUTUS_DISPATCH_ENABLED": True,
+            "IRIS_CHRONOS_DISPATCH_ENABLED": True,
+            "DISCORD_BOT_TOKEN": "discord-bot-token",
+            "DISCORD_CHANNEL_ALERT_ID": "chan-alert-456",
+        },
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+        chronos_dispatcher=chronos,
+        discord_transport=discord,
+    )
+
+    ok_resp = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<flight-nz502@example.com>",
+            "from_address": "tickets@airline.example",
+            "to_address": "iris@example.com",
+            "subject": "Flight NZ502 to Wellington",
+            "text_body": "Paid NZD 245.00. Departure 2026-12-01 09:30.",
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert ok_resp.status_code == 200
+    ok_body = ok_resp.json()
+    assert ok_body["dispatch_status"] == "dispatched"
+    assert {d["consumer"]: d["dispatch_status"] for d in ok_body["deliveries"]} == {
+        "plutus": "dispatched",
+        "chronos": "dispatched",
+    }
+
+    r_422 = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<dual-422@example.com>",
+            "from_address": "tickets@airline.example",
+            "to_address": "iris@example.com",
+            "subject": "Flight NZ502 Bad Date",
+            "text_body": "Paid NZD 245.00.",
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert r_422.status_code == 200
+    assert r_422.json()["dispatch_status"] == "failed"
+    assert {d["consumer"]: d["dispatch_status"] for d in r_422.json()["deliveries"]} == {
+        "plutus": "dispatched",
+        "chronos": "failed",
+    }
+
+    r_503 = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<dual-503@example.com>",
+            "from_address": "tickets@airline.example",
+            "to_address": "iris@example.com",
+            "subject": "Flight NZ502 Retryable",
+            "text_body": "Paid NZD 245.00.",
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert r_503.status_code == 503
+    assert r_503.json()["dispatch_status"] == "failed"
+    assert [post.channel_id for post in discord.posts] == ["chan-alert-456", "chan-alert-456"]
+
+
+def test_settings_strips_chronos_webhook_secret_whitespace() -> None:
+    cfg = Settings(
+        _env_file=None,
+        CHRONOS_WEBHOOK_SECRET="  chronos-trimmed-secret\n",
+        IRIS_CHRONOS_DISPATCH_ENABLED=True,
+    )
+    assert cfg.CHRONOS_WEBHOOK_SECRET == "chronos-trimmed-secret"
+    assert cfg.IRIS_CHRONOS_DISPATCH_ENABLED is True
+

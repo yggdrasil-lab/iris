@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Optional
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
@@ -38,6 +38,11 @@ class InboundEmail(Base):
         cascade="all, delete-orphan",
         order_by="InboundEmailAttachment.id",
     )
+    deliveries: Mapped[list["InboundEmailDelivery"]] = relationship(
+        back_populates="email",
+        cascade="all, delete-orphan",
+        order_by="InboundEmailDelivery.id",
+    )
 
 
 class InboundEmailAttachment(Base):
@@ -62,3 +67,43 @@ class InboundEmailAttachment(Base):
     )
 
     email: Mapped["InboundEmail"] = relationship(back_populates="attachments")
+
+
+class InboundEmailDelivery(Base):
+    """Per-consumer delivery ledger record for multi-target email fanout."""
+
+    __tablename__ = "inbound_email_deliveries"
+    __table_args__ = (
+        Index(
+            "uq_inbound_email_deliveries_email_consumer",
+            "email_id",
+            "consumer",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("inbound_emails.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    consumer: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    dispatch_status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, default="pending"
+    )
+    consumer_ref: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    error_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatched_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    email: Mapped["InboundEmail"] = relationship(back_populates="deliveries")

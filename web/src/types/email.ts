@@ -17,11 +17,26 @@ export type DispatchStatusType =
 export interface JevVerdict {
   route_target: RouteTargetType | string;
   has_actionable_amount: boolean;
+  has_schedule_event?: boolean;
+  schedule_confidence?: number | null;
   confidence: number;
   urgency_score: number;
   reason: string;
   provider: string;
   [key: string]: unknown;
+}
+
+export interface InboundEmailDeliveryRead {
+  id: number;
+  email_id: number;
+  consumer: string;
+  dispatch_status: string;
+  consumer_ref: string | null;
+  error_detail: string | null;
+  retry_count: number;
+  dispatched_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface InboundEmailAttachmentMeta {
@@ -56,6 +71,7 @@ export interface InboundEmailRead {
   consumer_ref: string | null;
   error_detail: string | null;
   retry_count: number;
+  deliveries?: InboundEmailDeliveryRead[];
   created_at: string;
   updated_at: string;
 }

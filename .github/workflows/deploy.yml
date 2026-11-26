@@ -68,6 +68,8 @@ jobs:
       MUNINN_JEV_MODEL: jev-decision
       PLUTUS_API_URL: http://plutus-api:8000
       IRIS_PLUTUS_DISPATCH_ENABLED: "true"
+      CHRONOS_API_URL: http://chronos-api:8000
+      IRIS_CHRONOS_DISPATCH_ENABLED: "true"
 
     steps:
       - name: Checkout code
@@ -84,6 +86,7 @@ jobs:
           IRIS_DB_PASSWORD: ${{ secrets.IRIS_DB_PASSWORD }}
           IRIS_WEBHOOK_SECRET: ${{ secrets.IRIS_WEBHOOK_SECRET }}
           PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}
+          CHRONOS_WEBHOOK_SECRET: ${{ secrets.CHRONOS_WEBHOOK_SECRET }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           AWS_REGION: ${{ vars.AWS_REGION }}
@@ -106,6 +109,9 @@ jobs:
           [ -z "$IRIS_WEBHOOK_SECRET" ] && MISSING="$MISSING IRIS_WEBHOOK_SECRET"
           if [ "${IRIS_PLUTUS_DISPATCH_ENABLED}" = "true" ] && [ -z "$PLUTUS_WEBHOOK_SECRET" ]; then
             MISSING="$MISSING PLUTUS_WEBHOOK_SECRET"
+          fi
+          if [ "${IRIS_CHRONOS_DISPATCH_ENABLED}" = "true" ] && [ -z "$CHRONOS_WEBHOOK_SECRET" ]; then
+            MISSING="$MISSING CHRONOS_WEBHOOK_SECRET"
           fi
           [ -z "$DOMAIN_NAME" ] && MISSING="$MISSING DOMAIN_NAME"
           [ -z "$REGISTRY_PREFIX" ] && MISSING="$MISSING REGISTRY_PREFIX"
@@ -163,6 +169,7 @@ jobs:
           MUNINN_API_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           IRIS_ALERT_TRIAGE_ENABLED: ${{ vars.IRIS_ALERT_TRIAGE_ENABLED }}
           PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}
+          CHRONOS_WEBHOOK_SECRET: ${{ secrets.CHRONOS_WEBHOOK_SECRET }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
           chmod +x /tmp/deploy.sh
