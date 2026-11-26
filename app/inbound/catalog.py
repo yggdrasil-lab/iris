@@ -97,6 +97,13 @@ _ACTIONABLE_AMOUNT_INSTRUCTIONS = (
     "False if no concrete monetary transaction amount or invoice/receipt/payslip attachment is present."
 )
 
+_SCHEDULE_EVENT_INSTRUCTIONS = (
+    "True if the email contains a calendar invitation, .ics attachment, scheduled appointment, "
+    "travel or venue booking with a specific date/time (flight, hotel check-in, restaurant reservation, "
+    "medical/dentist visit, event ticket, meeting), or an explicit scheduled deadline/due date; "
+    "False if there is no concrete scheduled event or time-bound booking."
+)
+
 _SIGNIFICANCE_SCORE_CRITERIA = [
     "Marketing promo, newsletter, OTP code, or shipping tracking noise with no financial or action relevance",
     "Low-priority informational email without urgent financial or operator action",
@@ -128,6 +135,10 @@ def build_inbound_email_questions() -> Dict[str, Any]:
         "has_actionable_amount": {
             "type": "noul",
             "instructions": _ACTIONABLE_AMOUNT_INSTRUCTIONS,
+        },
+        "has_schedule_event": {
+            "type": "noul",
+            "instructions": _SCHEDULE_EVENT_INSTRUCTIONS,
         },
         "significance_score": {
             "type": "score",

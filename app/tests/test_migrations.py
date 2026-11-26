@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import InboundEmail, InboundEmailAttachment
+from app.db.models import InboundEmail, InboundEmailAttachment, InboundEmailDelivery
 
 
 def test_alembic_upgrade_downgrade_roundtrip(tmp_path: Path, monkeypatch) -> None:
@@ -41,11 +41,20 @@ def test_alembic_upgrade_downgrade_roundtrip(tmp_path: Path, monkeypatch) -> Non
             row[1]
             for row in conn.execute("PRAGMA table_info(inbound_email_attachments)").fetchall()
         }
+        delivery_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(inbound_email_deliveries)").fetchall()
+        }
+        delivery_indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(inbound_email_deliveries)").fetchall()
+        }
 
     assert "inbound_emails" in tables
     assert "inbound_email_attachments" in tables
+    assert "inbound_email_deliveries" in tables
     assert version is not None
-    assert version[0] == "0001_inbound_emails"
+    assert version[0] == "0002_multi_target_deliveries"
     assert {
         "id",
         "message_id",
@@ -76,6 +85,19 @@ def test_alembic_upgrade_downgrade_roundtrip(tmp_path: Path, monkeypatch) -> Non
         "content_base64",
         "created_at",
     }.issubset(att_cols)
+    assert {
+        "id",
+        "email_id",
+        "consumer",
+        "dispatch_status",
+        "consumer_ref",
+        "error_detail",
+        "retry_count",
+        "dispatched_at",
+        "created_at",
+        "updated_at",
+    }.issubset(delivery_cols)
+    assert "uq_inbound_email_deliveries_email_consumer" in delivery_indexes
 
     # Verify downgrade -> upgrade roundtrip
     alembic_command.downgrade(cfg, "base")
@@ -88,6 +110,7 @@ def test_alembic_upgrade_downgrade_roundtrip(tmp_path: Path, monkeypatch) -> Non
         }
     assert "inbound_emails" not in down_tables
     assert "inbound_email_attachments" not in down_tables
+    assert "inbound_email_deliveries" not in down_tables
 
     alembic_command.upgrade(cfg, "head")
     engine = create_engine(db_url)
@@ -109,6 +132,13 @@ def test_alembic_upgrade_downgrade_roundtrip(tmp_path: Path, monkeypatch) -> Non
                         content_base64="dGVzdA==",
                     )
                 ],
+                deliveries=[
+                    InboundEmailDelivery(
+                        consumer="chronos",
+                        dispatch_status="dispatched",
+                        consumer_ref="chronos-evt-1",
+                    )
+                ],
             )
             session.add(email_row)
             session.commit()
@@ -118,6 +148,9 @@ def test_alembic_upgrade_downgrade_roundtrip(tmp_path: Path, monkeypatch) -> Non
             assert loaded is not None
             assert len(loaded.attachments) == 1
             assert loaded.attachments[0].filename == "invoice.pdf"
+            assert len(loaded.deliveries) == 1
+            assert loaded.deliveries[0].consumer == "chronos"
+            assert loaded.deliveries[0].consumer_ref == "chronos-evt-1"
     finally:
         engine.dispose()
 

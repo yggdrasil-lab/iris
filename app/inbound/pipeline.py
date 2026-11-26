@@ -1,14 +1,15 @@
 import base64
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.alerting import OutboundAlerter
-from app.db.models import InboundEmail, InboundEmailAttachment
+from app.db.models import InboundEmail, InboundEmailAttachment, InboundEmailDelivery
 from app.inbound.catalog import (
     build_inbound_email_questions,
     build_inbound_email_state_text,
@@ -17,17 +18,19 @@ from app.inbound.catalog import (
     is_valid_route_target,
 )
 from app.inbound.ports import (
+    ConsumerAttachmentPayload,
+    ConsumerDispatchPort,
+    ConsumerDispatchRequest,
+    ConsumerDispatchResult,
     InboundActionResult,
     InboundConfig,
     InboundEmailNotFoundError,
-    PlutusAttachmentPayload,
-    PlutusDispatchPort,
-    PlutusDispatchRequest,
 )
 from app.inbound.sanitizer import (
     build_raw_excerpt,
     clean_html_for_storage,
     ensure_utc,
+    has_calendar_attachment,
     has_document_attachment,
     normalize_message_id,
     truncate_body,
@@ -41,10 +44,24 @@ from app.jev import (
 )
 from app.models.schemas import (
     EmailRouteVerdict,
+    InboundEmailDeliveryRead,
     InboundEmailIngestResponse,
     InboundEmailWebhookPayload,
     RouteTargetType,
 )
+
+
+@dataclass(frozen=True)
+class _RoutingContext:
+    route_target: RouteTargetType
+    has_actionable_amount: bool
+    has_schedule_event: bool
+    route_confidence_ok: bool
+    confidence_value: float
+    verdict_reason: str
+    manual_reroute: bool
+    is_retry: bool
+    notify_operator: bool
 
 
 def _verdict_from_row(row: InboundEmail) -> Optional[EmailRouteVerdict]:
@@ -60,6 +77,9 @@ def build_ingest_response(result: InboundActionResult) -> InboundEmailIngestResp
     """Project a typed InboundActionResult onto the public webhook response schema."""
     row = result.email
     status_label = "duplicate" if result.duplicate else row.dispatch_status
+    deliveries = [
+        InboundEmailDeliveryRead.model_validate(item) for item in (row.deliveries or [])
+    ]
     return InboundEmailIngestResponse(
         status=status_label,
         duplicate=result.duplicate,
@@ -70,12 +90,13 @@ def build_ingest_response(result: InboundActionResult) -> InboundEmailIngestResp
         consumer_ref=row.consumer_ref,
         error_detail=row.error_detail,
         jev_verdict=_verdict_from_row(row),
+        deliveries=deliveries,
     )
 
 
-def _build_plutus_request(email_row: InboundEmail) -> PlutusDispatchRequest:
+def _build_dispatch_request(email_row: InboundEmail) -> ConsumerDispatchRequest:
     attachments = tuple(
-        PlutusAttachmentPayload(
+        ConsumerAttachmentPayload(
             filename=att.filename,
             content_type=att.content_type,
             size_bytes=att.size_bytes,
@@ -84,7 +105,7 @@ def _build_plutus_request(email_row: InboundEmail) -> PlutusDispatchRequest:
         )
         for att in email_row.attachments
     )
-    return PlutusDispatchRequest(
+    return ConsumerDispatchRequest(
         email_id=email_row.id,
         message_id=email_row.message_id,
         route_target=email_row.route_target,
@@ -156,7 +177,12 @@ def _persist_inbound_email(
         received_at=received_at,
         text_body=payload.text_body,
     )
-    existing = db.scalar(select(InboundEmail).where(InboundEmail.message_id == message_id))
+    existing_stmt = (
+        select(InboundEmail)
+        .options(selectinload(InboundEmail.deliveries), selectinload(InboundEmail.attachments))
+        .where(InboundEmail.message_id == message_id)
+    )
+    existing = db.scalar(existing_stmt)
     if existing is not None:
         return existing, True
 
@@ -166,31 +192,91 @@ def _persist_inbound_email(
         db.commit()
     except IntegrityError:
         db.rollback()
-        existing_after_race = db.scalar(
-            select(InboundEmail).where(InboundEmail.message_id == message_id)
-        )
+        existing_after_race = db.scalar(existing_stmt)
         if existing_after_race is not None:
             return existing_after_race, True
         raise
     db.refresh(email_row)
     _ = list(email_row.attachments)
+    _ = list(email_row.deliveries)
     return email_row, False
 
 
+def _resolve_schedule_detection(
+    parsed: Mapping[str, Any],
+    attachments_meta: List[Dict[str, Any]],
+    confidence_threshold: float,
+) -> Tuple[bool, Optional[float]]:
+    if has_calendar_attachment(attachments_meta):
+        return True, 1.0
+    if not parse_bool(parsed.get("has_schedule_event", False)):
+        return False, None
+    schedule_confidence = resolve_calibrated_confidence(
+        parsed, question_keys=("has_schedule_event",), context_label="email_schedule"
+    )
+    return schedule_confidence >= confidence_threshold, schedule_confidence
+
+
+def _sync_email_scalar_status(
+    email_row: InboundEmail,
+    active_deliveries: Sequence[InboundEmailDelivery],
+    failed_deliveries: Sequence[InboundEmailDelivery],
+) -> None:
+    if len(active_deliveries) == 1:
+        email_row.consumer_ref = active_deliveries[0].consumer_ref
+    else:
+        labeled_refs = [
+            f"{item.consumer}:{item.consumer_ref}"
+            for item in active_deliveries
+            if item.dispatch_status == "dispatched" and item.consumer_ref
+        ]
+        if labeled_refs:
+            email_row.consumer_ref = ", ".join(labeled_refs)[:256]
+
+    if not failed_deliveries:
+        email_row.dispatch_status = "dispatched"
+        email_row.error_detail = None
+        return
+
+    email_row.dispatch_status = "failed"
+    if len(active_deliveries) == 1:
+        email_row.error_detail = failed_deliveries[0].error_detail
+    else:
+        email_row.error_detail = "; ".join(
+            f"{item.consumer}: {item.error_detail}"
+            for item in failed_deliveries
+            if item.error_detail
+        )
+
+
+def _format_failure_alert_title(email_id: int, failed: Sequence[InboundEmailDelivery]) -> str:
+    if len(failed) == 1:
+        return f"{failed[0].consumer.capitalize()} Dispatch Failed: Email #{email_id}"
+    names = ", ".join(item.consumer for item in failed)
+    return f"Consumer Dispatch Failed ({names}): Email #{email_id}"
+
+
 class InboundEmailPipeline:
-    """Deep domain pipeline for inbound email capture, Jev routing, Evidence Guards, and Plutus dispatch."""
+    """Deep domain pipeline for inbound email capture, Jev routing, and multi-target dispatch."""
 
     def __init__(
         self,
         *,
         config: InboundConfig,
         jev: JevClientPort,
-        plutus: PlutusDispatchPort,
+        plutus: Optional[ConsumerDispatchPort] = None,
+        chronos: Optional[ConsumerDispatchPort] = None,
+        consumers: Optional[Mapping[str, ConsumerDispatchPort]] = None,
         alerter: OutboundAlerter,
     ) -> None:
         self._config = config
         self._jev = jev
-        self._plutus = plutus
+        resolved_consumers: Dict[str, ConsumerDispatchPort] = dict(consumers or {})
+        if plutus is not None:
+            resolved_consumers.setdefault("plutus", plutus)
+        if chronos is not None:
+            resolved_consumers.setdefault("chronos", chronos)
+        self._consumers = resolved_consumers
         self._alerter = alerter
 
     async def classify_email(
@@ -213,31 +299,30 @@ class InboundEmailPipeline:
             raise JevRouterUnavailableError(
                 f"Invalid or missing route_target from Muninn Jev: {route_target!r}"
             )
-        has_actionable_amount = parse_bool(parsed.get("has_actionable_amount", False))
-        scaled_score = parse_clamped_score(parsed.get("significance_score"), default=5)
-        overall_confidence = resolve_calibrated_confidence(
+        has_amount = parse_bool(parsed.get("has_actionable_amount", False))
+        score = parse_clamped_score(parsed.get("significance_score"), default=5)
+        conf = resolve_calibrated_confidence(
             parsed, question_keys=("route_target", "has_actionable_amount"), context_label="email"
         )
-        typed_target: RouteTargetType = route_target  # type: ignore[assignment]
+        has_sched, sched_conf = _resolve_schedule_detection(
+            parsed, attachments_meta, self._config.confidence_threshold
+        )
         return EmailRouteVerdict(
-            route_target=typed_target,
-            has_actionable_amount=has_actionable_amount,
-            confidence=overall_confidence,
-            urgency_score=scaled_score,
+            route_target=route_target,  # type: ignore[arg-type]
+            has_actionable_amount=has_amount,
+            has_schedule_event=has_sched,
+            schedule_confidence=sched_conf,
+            confidence=conf,
+            urgency_score=score,
             reason=(
                 f"Jev classified as {route_target} "
-                f"(amount={has_actionable_amount}, score={scaled_score}/10, conf={overall_confidence:.2f})"
+                f"(amount={has_amount}, schedule={has_sched}, score={score}/10, conf={conf:.2f})"
             ),
             provider="muninn-jev",
         )
 
     async def _send_operator_notice(
-        self,
-        *,
-        title: str,
-        details: str,
-        severity: Literal["error", "warning"],
-        channel: str,
+        self, *, title: str, details: str, severity: Literal["error", "warning"], channel: str
     ) -> None:
         await self._alerter.send_operator_notice(
             service="iris-inbound",
@@ -257,123 +342,222 @@ class InboundEmailPipeline:
         title: str,
         details: str,
         notify_decisions: bool,
+        delivery_unavailable: bool = False,
     ) -> InboundActionResult:
         email_row.dispatch_status = "needs_review"
         email_row.error_detail = error_detail
         db.commit()
         db.refresh(email_row)
+        _ = list(email_row.deliveries)
         if notify_decisions:
             await self._send_operator_notice(
-                title=title,
-                details=details,
-                severity="warning",
-                channel="decisions",
-            )
-        return InboundActionResult(email=email_row, disposition="needs_review")
-
-    async def _dispatch_plutus_route(
-        self,
-        db: Session,
-        email_row: InboundEmail,
-        route_target: RouteTargetType,
-        *,
-        has_actionable_amount: bool,
-        manual_reroute: bool,
-        notify_operator: bool,
-    ) -> InboundActionResult:
-        if not manual_reroute:
-            guard = evaluate_evidence_guard(
-                route_target,
-                email_id=email_row.id,
-                from_address=email_row.from_address,
-                subject=email_row.subject,
-                has_actionable_amount=has_actionable_amount,
-                has_document_attachment=has_document_attachment(email_row.attachments_meta),
-            )
-            if guard is not None:
-                return await self._park_for_review(
-                    db,
-                    email_row,
-                    error_detail=guard.error_detail,
-                    title=guard.title,
-                    details=guard.details,
-                    notify_decisions=notify_operator,
-                )
-
-        if not self._config.plutus_dispatch_enabled:
-            email_row.dispatch_status = "needs_review"
-            email_row.error_detail = "plutus_dispatch_disabled_phase1_capture"
-            db.commit()
-            db.refresh(email_row)
-            return InboundActionResult(email=email_row, disposition="needs_review")
-
-        plutus_result = await self._plutus.dispatch_email(_build_plutus_request(email_row))
-        if plutus_result.status == "dispatched":
-            email_row.dispatch_status = "dispatched"
-            email_row.consumer_ref = plutus_result.consumer_ref
-            email_row.error_detail = None
-            db.commit()
-            db.refresh(email_row)
-            return InboundActionResult(email=email_row, disposition="dispatched")
-
-        email_row.dispatch_status = "failed"
-        email_row.error_detail = plutus_result.error_detail
-        db.commit()
-        db.refresh(email_row)
-        if notify_operator:
-            await self._send_operator_notice(
-                title=f"Plutus Dispatch Failed: Email #{email_row.id}",
-                details=f"Route: {route_target}\nError: {plutus_result.error_detail}",
-                severity="error",
-                channel="alerts",
+                title=title, details=details, severity="warning", channel="decisions"
             )
         return InboundActionResult(
-            email=email_row,
-            disposition="failed",
-            delivery_unavailable=(plutus_result.status == "unavailable"),
+            email=email_row, disposition="needs_review", delivery_unavailable=delivery_unavailable
         )
 
-    async def _apply_route_target(
+    def _resolve_plutus_block(
+        self, email_row: InboundEmail, ctx: _RoutingContext
+    ) -> Optional[Tuple[Optional[str], str, str]]:
+        if ctx.manual_reroute:
+            return None
+        if not ctx.route_confidence_ok:
+            threshold = self._config.confidence_threshold
+            return (
+                f"low_confidence: {ctx.confidence_value:.2f} < {threshold:.2f}",
+                f"Low-Confidence Email Needs Review: {email_row.subject or '(no subject)'}",
+                (
+                    f"Email #{email_row.id} from {email_row.from_address}\n"
+                    f"Suggested route: {ctx.route_target} (confidence {ctx.confidence_value:.2f})\n"
+                    f"Reason: {ctx.verdict_reason}"
+                ),
+            )
+        guard = evaluate_evidence_guard(
+            ctx.route_target,
+            email_id=email_row.id,
+            from_address=email_row.from_address,
+            subject=email_row.subject,
+            has_actionable_amount=ctx.has_actionable_amount,
+            has_document_attachment=has_document_attachment(email_row.attachments_meta),
+        )
+        return (guard.error_detail, guard.title, guard.details) if guard is not None else None
+
+    def _ensure_delivery_row(
         self,
         db: Session,
         email_row: InboundEmail,
+        consumer: str,
+        existing: Optional[InboundEmailDelivery],
         *,
-        route_target: RouteTargetType,
-        has_actionable_amount: bool,
-        manual_reroute: bool,
-        notify_operator: bool,
-    ) -> InboundActionResult:
-        spec = get_route_spec(route_target)
-        email_row.route_target = spec.target
+        is_retry: bool,
+    ) -> InboundEmailDelivery:
+        if existing is None:
+            delivery = InboundEmailDelivery(
+                email_id=email_row.id, consumer=consumer, dispatch_status="pending", retry_count=0
+            )
+            db.add(delivery)
+            email_row.deliveries.append(delivery)
+            return delivery
+        if is_retry:
+            existing.retry_count += 1
+        return existing
 
-        if spec.target == "ignore":
+    async def _dispatch_single_consumer(
+        self,
+        db: Session,
+        email_row: InboundEmail,
+        consumer: str,
+        dispatch_request: ConsumerDispatchRequest,
+        existing: Optional[InboundEmailDelivery],
+        *,
+        is_retry: bool,
+    ) -> Tuple[InboundEmailDelivery, bool]:
+        if existing is not None and existing.dispatch_status == "dispatched":
+            return existing, False
+        delivery = self._ensure_delivery_row(db, email_row, consumer, existing, is_retry=is_retry)
+        adapter = self._consumers.get(consumer)
+        result = (
+            await adapter.dispatch_email(dispatch_request)
+            if adapter is not None
+            else ConsumerDispatchResult(
+                status="unavailable",
+                error_detail=f"{consumer}_dispatch_misconfigured: dispatcher not registered",
+            )
+        )
+        if result.status == "dispatched":
+            delivery.dispatch_status = "dispatched"
+            delivery.consumer_ref = result.consumer_ref
+            delivery.error_detail = None
+            delivery.dispatched_at = datetime.now(timezone.utc)
+            return delivery, False
+        delivery.dispatch_status = "failed"
+        delivery.error_detail = result.error_detail
+        return delivery, (result.status == "unavailable")
+
+    async def _fanout_to_consumers(
+        self,
+        db: Session,
+        email_row: InboundEmail,
+        consumers: Sequence[str],
+        *,
+        is_retry: bool,
+        notify_operator: bool,
+    ) -> Tuple[List[InboundEmailDelivery], List[InboundEmailDelivery], bool]:
+        dispatch_request = _build_dispatch_request(email_row)
+        existing_by_consumer = {item.consumer: item for item in (email_row.deliveries or [])}
+        active: List[InboundEmailDelivery] = []
+        failed: List[InboundEmailDelivery] = []
+        has_transient = False
+
+        for consumer in consumers:
+            delivery, is_unavailable = await self._dispatch_single_consumer(
+                db, email_row, consumer, dispatch_request,
+                existing_by_consumer.get(consumer), is_retry=is_retry,
+            )
+            active.append(delivery)
+            if delivery.dispatch_status != "dispatched":
+                failed.append(delivery)
+                has_transient = has_transient or is_unavailable
+
+        if failed and notify_operator:
+            details = f"Route: {email_row.route_target}\n" + "\n".join(
+                f"{item.consumer}: {item.error_detail}" for item in failed
+            )
+            await self._send_operator_notice(
+                title=_format_failure_alert_title(email_row.id, failed),
+                details=details, severity="error", channel="alerts",
+            )
+        return active, failed, has_transient
+
+    def _enabled_consumers(self, *, wants_plutus: bool, wants_chronos: bool) -> List[str]:
+        enabled: List[str] = []
+        if wants_plutus and self._config.plutus_dispatch_enabled:
+            enabled.append("plutus")
+        if wants_chronos and self._config.chronos_dispatch_enabled:
+            enabled.append("chronos")
+        return enabled
+
+    async def _handle_non_consumer_route(
+        self, db: Session, email_row: InboundEmail, ctx: _RoutingContext
+    ) -> InboundActionResult:
+        if not ctx.manual_reroute and not ctx.route_confidence_ok:
+            block = self._resolve_plutus_block(email_row, ctx)
+            assert block is not None
+            return await self._park_for_review(
+                db, email_row, error_detail=block[0], title=block[1],
+                details=block[2], notify_decisions=ctx.notify_operator,
+            )
+        if ctx.route_target == "ignore":
             email_row.dispatch_status = "ignored"
             email_row.error_detail = None
             db.commit()
             db.refresh(email_row)
             return InboundActionResult(email=email_row, disposition="ignored")
+        subject_label = email_row.subject or "(no subject)"
+        return await self._park_for_review(
+            db, email_row, error_detail=None, title=f"Actionable Notice: {subject_label}",
+            details=(
+                f"Email #{email_row.id} from {email_row.from_address} marked actionable_notice.\n"
+                f"{email_row.raw_excerpt or ''}"
+            ),
+            notify_decisions=ctx.notify_operator,
+        )
 
-        if spec.target == "actionable_notice":
-            subject_label = email_row.subject or "(no subject)"
+    async def _park_plutus_block(
+        self,
+        db: Session,
+        email_row: InboundEmail,
+        plutus_block: Tuple[Optional[str], str, str],
+        ctx: _RoutingContext,
+    ) -> InboundActionResult:
+        has_transient = False
+        if ctx.has_schedule_event and self._config.chronos_dispatch_enabled:
+            _, _, has_transient = await self._fanout_to_consumers(
+                db, email_row, ["chronos"], is_retry=ctx.is_retry, notify_operator=ctx.notify_operator
+            )
+        return await self._park_for_review(
+            db, email_row, error_detail=plutus_block[0], title=plutus_block[1],
+            details=plutus_block[2], notify_decisions=ctx.notify_operator,
+            delivery_unavailable=has_transient,
+        )
+
+    async def _apply_routing_and_dispatch(
+        self, db: Session, email_row: InboundEmail, ctx: _RoutingContext
+    ) -> InboundActionResult:
+        spec = get_route_spec(ctx.route_target)
+        email_row.route_target = spec.target
+        if not spec.dispatches_to_plutus and not ctx.has_schedule_event:
+            return await self._handle_non_consumer_route(db, email_row, ctx)
+
+        plutus_block = self._resolve_plutus_block(email_row, ctx) if spec.dispatches_to_plutus else None
+        if plutus_block is not None:
+            return await self._park_plutus_block(db, email_row, plutus_block, ctx)
+
+        consumers = self._enabled_consumers(
+            wants_plutus=spec.dispatches_to_plutus, wants_chronos=ctx.has_schedule_event
+        )
+        if not consumers:
+            reason = (
+                "plutus_dispatch_disabled_phase1_capture"
+                if spec.dispatches_to_plutus
+                else "chronos_dispatch_disabled"
+            )
             return await self._park_for_review(
-                db,
-                email_row,
-                error_detail=None,
-                title=f"Actionable Notice: {subject_label}",
-                details=(
-                    f"Email #{email_row.id} from {email_row.from_address} marked actionable_notice.\n"
-                    f"{email_row.raw_excerpt or ''}"
-                ),
-                notify_decisions=notify_operator,
+                db, email_row, error_detail=reason, title="", details="", notify_decisions=False
             )
 
-        return await self._dispatch_plutus_route(
-            db,
-            email_row,
-            spec.target,
-            has_actionable_amount=has_actionable_amount,
-            manual_reroute=manual_reroute,
-            notify_operator=notify_operator,
+        active, failed, has_transient = await self._fanout_to_consumers(
+            db, email_row, consumers, is_retry=ctx.is_retry, notify_operator=ctx.notify_operator
+        )
+        _sync_email_scalar_status(email_row, active, failed)
+        db.commit()
+        db.refresh(email_row)
+        _ = list(email_row.deliveries)
+        return InboundActionResult(
+            email=email_row,
+            disposition="failed" if failed else "dispatched",
+            delivery_unavailable=has_transient,
         )
 
     async def _classify_and_dispatch(
@@ -382,56 +566,47 @@ class InboundEmailPipeline:
         email_row: InboundEmail,
         *,
         manual_reroute: bool,
+        is_retry: bool,
         notify_operator: bool,
     ) -> InboundActionResult:
         try:
             verdict = await self.classify_email(
-                from_address=email_row.from_address,
-                to_address=email_row.to_address,
-                subject=email_row.subject,
-                received_at=email_row.received_at,
-                raw_excerpt=email_row.raw_excerpt or "",
-                attachments_meta=email_row.attachments_meta or [],
+                from_address=email_row.from_address, to_address=email_row.to_address,
+                subject=email_row.subject, received_at=email_row.received_at,
+                raw_excerpt=email_row.raw_excerpt or "", attachments_meta=email_row.attachments_meta or [],
             )
         except JevRouterUnavailableError as exc:
-            email_row.dispatch_status = "failed"
-            email_row.error_detail = f"jev_router_unavailable: {exc}"
-            db.commit()
-            db.refresh(email_row)
-            if notify_operator:
-                await self._send_operator_notice(
-                    title=f"Jev Email Router Unavailable: Email #{email_row.id}",
-                    details=f"From: {email_row.from_address}\nSubject: {email_row.subject}\nError: {exc}",
-                    severity="error",
-                    channel="alerts",
-                )
-            return InboundActionResult(email=email_row, disposition="failed", delivery_unavailable=True)
+            return await self._handle_jev_unavailable(db, email_row, exc, notify_operator)
 
         email_row.jev_verdict = verdict.model_dump()
         email_row.route_target = verdict.route_target
-        if verdict.confidence < self._config.confidence_threshold:
-            threshold = self._config.confidence_threshold
-            return await self._park_for_review(
-                db,
-                email_row,
-                error_detail=f"low_confidence: {verdict.confidence:.2f} < {threshold:.2f}",
-                title=f"Low-Confidence Email Needs Review: {email_row.subject or '(no subject)'}",
-                details=(
-                    f"Email #{email_row.id} from {email_row.from_address}\n"
-                    f"Suggested route: {verdict.route_target} (confidence {verdict.confidence:.2f})\n"
-                    f"Reason: {verdict.reason}"
-                ),
-                notify_decisions=notify_operator,
-            )
-
-        return await self._apply_route_target(
-            db,
-            email_row,
+        ctx = _RoutingContext(
             route_target=verdict.route_target,
             has_actionable_amount=verdict.has_actionable_amount,
+            has_schedule_event=verdict.has_schedule_event,
+            route_confidence_ok=(verdict.confidence >= self._config.confidence_threshold),
+            confidence_value=verdict.confidence,
+            verdict_reason=verdict.reason,
             manual_reroute=manual_reroute,
+            is_retry=is_retry,
             notify_operator=notify_operator,
         )
+        return await self._apply_routing_and_dispatch(db, email_row, ctx)
+
+    async def _handle_jev_unavailable(
+        self, db: Session, email_row: InboundEmail, exc: Exception, notify_operator: bool
+    ) -> InboundActionResult:
+        email_row.dispatch_status = "failed"
+        email_row.error_detail = f"jev_router_unavailable: {exc}"
+        db.commit()
+        db.refresh(email_row)
+        if notify_operator:
+            await self._send_operator_notice(
+                title=f"Jev Email Router Unavailable: Email #{email_row.id}",
+                details=f"From: {email_row.from_address}\nSubject: {email_row.subject}\nError: {exc}",
+                severity="error", channel="alerts",
+            )
+        return InboundActionResult(email=email_row, disposition="failed", delivery_unavailable=True)
 
     async def ingest(self, db: Session, payload: InboundEmailWebhookPayload) -> InboundActionResult:
         """Persist, classify, and dispatch an inbound email idempotently."""
@@ -439,66 +614,61 @@ class InboundEmailPipeline:
         if is_duplicate:
             return InboundActionResult(email=email_row, disposition="duplicate", duplicate=True)
         return await self._classify_and_dispatch(
-            db, email_row, manual_reroute=False, notify_operator=True
+            db, email_row, manual_reroute=False, is_retry=False, notify_operator=True
         )
 
     async def retry(
-        self,
-        db: Session,
-        email_id: int,
-        *,
-        reclassify: bool = False,
+        self, db: Session, email_id: int, *, reclassify: bool = False
     ) -> InboundActionResult:
         """Retry dispatching an inbound email, optionally re-running Jev classification."""
         email_row = self.get_email_with_attachments(db, email_id)
         if email_row is None:
             raise InboundEmailNotFoundError(f"Inbound email {email_id} not found")
-
         email_row.retry_count += 1
         email_row.error_detail = None
-        needs_classify = (
-            reclassify or not is_valid_route_target(email_row.route_target) or not email_row.jev_verdict
-        )
-        if needs_classify:
+        if reclassify or not is_valid_route_target(email_row.route_target) or not email_row.jev_verdict:
             if email_row.text_body is not None or email_row.html_excerpt is not None:
                 email_row.raw_excerpt = build_raw_excerpt(email_row.text_body, email_row.html_excerpt)
             return await self._classify_and_dispatch(
-                db, email_row, manual_reroute=False, notify_operator=False
+                db, email_row, manual_reroute=False, is_retry=True, notify_operator=False
             )
-
-        existing_route: RouteTargetType = email_row.route_target  # type: ignore[assignment]
-        return await self._apply_route_target(
-            db,
-            email_row,
-            route_target=existing_route,
-            has_actionable_amount=True,
-            manual_reroute=True,
-            notify_operator=False,
+        cached = _verdict_from_row(email_row)
+        has_sched = (
+            has_calendar_attachment(email_row.attachments_meta)
+            or bool(cached and cached.has_schedule_event)
+            or any(item.consumer == "chronos" for item in email_row.deliveries)
         )
+        ctx = _RoutingContext(
+            route_target=email_row.route_target,  # type: ignore[arg-type]
+            has_actionable_amount=True, has_schedule_event=has_sched, route_confidence_ok=True,
+            confidence_value=cached.confidence if cached else 1.0,
+            verdict_reason=cached.reason if cached else "",
+            manual_reroute=True, is_retry=True, notify_operator=False,
+        )
+        return await self._apply_routing_and_dispatch(db, email_row, ctx)
 
     async def reroute(
-        self,
-        db: Session,
-        email_id: int,
-        *,
-        new_target: RouteTargetType,
+        self, db: Session, email_id: int, *, new_target: RouteTargetType
     ) -> InboundActionResult:
         """Manually override route_target and dispatch without Evidence Guard blocking."""
         spec = get_route_spec(new_target)
         email_row = self.get_email_with_attachments(db, email_id)
         if email_row is None:
             raise InboundEmailNotFoundError(f"Inbound email {email_id} not found")
-
         email_row.retry_count += 1
         email_row.error_detail = None
-        return await self._apply_route_target(
-            db,
-            email_row,
-            route_target=spec.target,
-            has_actionable_amount=True,
-            manual_reroute=True,
-            notify_operator=False,
+        cached = _verdict_from_row(email_row)
+        has_sched = spec.target != "ignore" and (
+            has_calendar_attachment(email_row.attachments_meta)
+            or bool(cached and cached.has_schedule_event)
+            or any(item.consumer == "chronos" for item in email_row.deliveries)
         )
+        ctx = _RoutingContext(
+            route_target=spec.target, has_actionable_amount=True, has_schedule_event=has_sched,
+            route_confidence_ok=True, confidence_value=1.0, verdict_reason="Operator manual reroute",
+            manual_reroute=True, is_retry=True, notify_operator=False,
+        )
+        return await self._apply_routing_and_dispatch(db, email_row, ctx)
 
     def ignore(self, db: Session, email_id: int) -> InboundActionResult:
         """Mark an inbound email as ignored without downstream dispatch or Discord notice."""
@@ -509,12 +679,16 @@ class InboundEmailPipeline:
         email_row.error_detail = None
         db.commit()
         db.refresh(email_row)
+        _ = list(email_row.deliveries)
         return InboundActionResult(email=email_row, disposition="ignored")
 
     def get_email_with_attachments(self, db: Session, email_id: int) -> Optional[InboundEmail]:
         return db.scalar(
             select(InboundEmail)
-            .options(selectinload(InboundEmail.attachments))
+            .options(
+                selectinload(InboundEmail.attachments),
+                selectinload(InboundEmail.deliveries),
+            )
             .where(InboundEmail.id == email_id)
         )
 
@@ -528,7 +702,7 @@ class InboundEmailPipeline:
         page: int = 1,
         page_size: int = 25,
     ) -> Tuple[List[InboundEmail], int]:
-        stmt = select(InboundEmail)
+        stmt = select(InboundEmail).options(selectinload(InboundEmail.deliveries))
         count_stmt = select(func.count()).select_from(InboundEmail)
 
         conditions = []

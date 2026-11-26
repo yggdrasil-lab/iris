@@ -28,6 +28,8 @@ class TriageResult(BaseModel):
 class EmailRouteVerdict(BaseModel):
     route_target: RouteTargetType
     has_actionable_amount: bool
+    has_schedule_event: bool = False
+    schedule_confidence: Optional[float] = None
     confidence: float
     urgency_score: int
     reason: str
@@ -141,6 +143,21 @@ class InboundEmailAttachmentRead(BaseModel):
     created_at: datetime
 
 
+class InboundEmailDeliveryRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email_id: int
+    consumer: str
+    dispatch_status: str
+    consumer_ref: Optional[str] = None
+    error_detail: Optional[str] = None
+    retry_count: int
+    dispatched_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class InboundEmailRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -158,6 +175,7 @@ class InboundEmailRead(BaseModel):
     consumer_ref: Optional[str] = None
     error_detail: Optional[str] = None
     retry_count: int
+    deliveries: List[InboundEmailDeliveryRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -178,6 +196,7 @@ class InboundEmailIngestResponse(BaseModel):
     consumer_ref: Optional[str] = None
     error_detail: Optional[str] = None
     jev_verdict: Optional[EmailRouteVerdict] = None
+    deliveries: List[InboundEmailDeliveryRead] = Field(default_factory=list)
 
 
 class InboundEmailListResponse(BaseModel):

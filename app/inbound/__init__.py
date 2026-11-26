@@ -10,9 +10,21 @@ from app.inbound.catalog import (
     get_route_spec,
     is_valid_route_target,
 )
+from app.inbound.consumer_adapter import (
+    CONSUMER_USER_AGENT,
+    PLUTUS_USER_AGENT,
+    HttpConsumerDispatchAdapter,
+    HttpPlutusDispatchAdapter,
+)
 from app.inbound.pipeline import InboundEmailPipeline, build_ingest_response
-from app.inbound.plutus_adapter import HttpPlutusDispatchAdapter, PLUTUS_USER_AGENT
 from app.inbound.ports import (
+    ConsumerAttachmentPayload,
+    ConsumerConfig,
+    ConsumerDispatchPort,
+    ConsumerDispatchRequest,
+    ConsumerDispatchResult,
+    ConsumerDispatchStatus,
+    ConsumerName,
     InboundActionResult,
     InboundConfig,
     InboundDisposition,
@@ -30,13 +42,23 @@ from app.inbound.sanitizer import (
     MAX_STORED_BODY_CHARS,
     build_raw_excerpt,
     clean_html_for_storage,
+    has_calendar_attachment,
     has_document_attachment,
     normalize_message_id,
     sanitize_html_to_text,
 )
 
 __all__ = [
+    "CONSUMER_USER_AGENT",
+    "ConsumerAttachmentPayload",
+    "ConsumerConfig",
+    "ConsumerDispatchPort",
+    "ConsumerDispatchRequest",
+    "ConsumerDispatchResult",
+    "ConsumerDispatchStatus",
+    "ConsumerName",
     "EvidenceGuardNotice",
+    "HttpConsumerDispatchAdapter",
     "HttpPlutusDispatchAdapter",
     "InboundActionResult",
     "InboundConfig",
@@ -64,6 +86,7 @@ __all__ = [
     "clean_html_for_storage",
     "evaluate_evidence_guard",
     "get_route_spec",
+    "has_calendar_attachment",
     "has_document_attachment",
     "is_valid_route_target",
     "normalize_message_id",

@@ -13,11 +13,12 @@ from sqlalchemy.orm import Session
 from app.container import IrisContainer, build_container
 from app.core.config import Settings
 from app.db.session import dispose_engines, get_session_factory
-from app.inbound.ports import PlutusDispatchPort
+from app.inbound.ports import ConsumerDispatchPort, ConsumerDispatchResult, PlutusDispatchPort
 from app.jev import JevClientPort
 from app.main import create_app
 from app.tests.fakes import (
     FakeClock,
+    InMemoryConsumerDispatcher,
     InMemoryDiscordTransport,
     InMemoryJevClient,
     InMemoryPlutusDispatcher,
@@ -33,6 +34,7 @@ class IrisTestHarness:
     settings: Settings
     jev: JevClientPort
     plutus: PlutusDispatchPort
+    chronos: ConsumerDispatchPort
     discord: InMemoryDiscordTransport
     ses: InMemorySesAdapter
     clock: FakeClock
@@ -57,6 +59,9 @@ def build_test_settings(database_url: str, **overrides: Any) -> Settings:
         "IRIS_PLUTUS_DISPATCH_ENABLED": False,
         "PLUTUS_API_URL": "http://plutus-api:8000",
         "PLUTUS_WEBHOOK_SECRET": "plutus-secret",
+        "IRIS_CHRONOS_DISPATCH_ENABLED": False,
+        "CHRONOS_API_URL": "http://chronos-api:8000",
+        "CHRONOS_WEBHOOK_SECRET": "chronos-secret",
         "IRIS_ALERT_CONFIDENCE_THRESHOLD": 0.80,
     }
     defaults.update(overrides)
@@ -100,6 +105,7 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
         settings_overrides: Optional[dict[str, Any]] = None,
         jev_client: Optional[JevClientPort] = None,
         plutus_dispatcher: Optional[PlutusDispatchPort] = None,
+        chronos_dispatcher: Optional[ConsumerDispatchPort] = None,
         discord_transport: Optional[InMemoryDiscordTransport] = None,
         ses_adapter: Optional[InMemorySesAdapter] = None,
         clock: Optional[FakeClock] = None,
@@ -107,6 +113,16 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
         cfg = build_test_settings(isolated_db_url, **(settings_overrides or {}))
         jev = jev_client if jev_client is not None else InMemoryJevClient()
         plutus = plutus_dispatcher if plutus_dispatcher is not None else InMemoryPlutusDispatcher()
+        chronos = (
+            chronos_dispatcher
+            if chronos_dispatcher is not None
+            else InMemoryConsumerDispatcher(
+                default_result=ConsumerDispatchResult(
+                    status="dispatched",
+                    consumer_ref="chronos-evt-1",
+                )
+            )
+        )
         discord = discord_transport if discord_transport is not None else InMemoryDiscordTransport()
         ses = ses_adapter if ses_adapter is not None else InMemorySesAdapter()
         clk = clock if clock is not None else FakeClock()
@@ -117,6 +133,7 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
             discord_transport=discord,
             clock=clk,
             plutus_dispatcher=plutus,
+            chronos_dispatcher=chronos,
         )
         test_app = create_app(container)
         test_client = stack.enter_context(TestClient(test_app))
@@ -127,6 +144,7 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
             settings=cfg,
             jev=jev,
             plutus=plutus,
+            chronos=chronos,
             discord=discord,
             ses=ses,
             clock=clk,

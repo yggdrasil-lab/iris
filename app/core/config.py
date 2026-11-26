@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     PLUTUS_WEBHOOK_SECRET: Optional[str] = None
     IRIS_PLUTUS_DISPATCH_ENABLED: bool = False
 
+    # Chronos internal overlay consumer dispatch
+    CHRONOS_API_URL: str = "http://chronos-api:8000"
+    CHRONOS_WEBHOOK_SECRET: Optional[str] = None
+    IRIS_CHRONOS_DISPATCH_ENABLED: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -66,6 +71,7 @@ class Settings(BaseSettings):
             "DISCORD_CHANNEL_WEALTH_ID",
             "MUNINN_API_KEY",
             "PLUTUS_WEBHOOK_SECRET",
+            "CHRONOS_WEBHOOK_SECRET",
         ):
             val = getattr(self, field_name)
             if isinstance(val, str):

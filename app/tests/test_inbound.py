@@ -12,6 +12,11 @@ from sqlalchemy.orm import Session
 from app.alerting import AlertingConfig, OutboundAlerter
 from app.db.models import InboundEmail
 from app.inbound import (
+    ConsumerConfig,
+    ConsumerDispatchPort,
+    ConsumerDispatchRequest,
+    ConsumerDispatchResult,
+    HttpConsumerDispatchAdapter,
     HttpPlutusDispatchAdapter,
     InboundConfig,
     InboundEmailNotFoundError,
@@ -29,6 +34,7 @@ from app.inbound import (
     build_inbound_email_questions,
     evaluate_evidence_guard,
     get_route_spec,
+    has_calendar_attachment,
     has_document_attachment,
 )
 from app.jev import JevConfig, JevRouterUnavailableError, MuninnJevAdapter
@@ -36,6 +42,7 @@ from app.models.schemas import InboundEmailWebhookPayload, RouteTargetType
 from app.tests.conftest import IrisTestHarness
 from app.tests.fakes import (
     FakeClock,
+    InMemoryConsumerDispatcher,
     InMemoryDiscordTransport,
     InMemoryJevClient,
     InMemoryPlutusDispatcher,
@@ -807,4 +814,254 @@ async def test_pipeline_retry_cached_verdict_and_ignore_emit_zero_discord_posts(
     assert ignore_res.disposition == "ignored"
     assert ignore_res.email.dispatch_status == "ignored"
     assert discord.posts == []
+
+
+def _make_multi_pipeline(
+    *,
+    confidence_threshold: float = 0.80,
+    plutus_dispatch_enabled: bool = True,
+    chronos_dispatch_enabled: bool = True,
+    jev: InMemoryJevClient | None = None,
+    plutus: InMemoryConsumerDispatcher | None = None,
+    chronos: InMemoryConsumerDispatcher | None = None,
+    discord: InMemoryDiscordTransport | None = None,
+) -> tuple[
+    InboundEmailPipeline,
+    InMemoryJevClient,
+    InMemoryConsumerDispatcher,
+    InMemoryConsumerDispatcher,
+    InMemoryDiscordTransport,
+]:
+    resolved_jev = jev or InMemoryJevClient()
+    resolved_plutus = plutus or InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-tx-1")
+    )
+    resolved_chronos = chronos or InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-1")
+    )
+    resolved_discord = discord or InMemoryDiscordTransport()
+    alerter = OutboundAlerter(
+        config=AlertingConfig(
+            bot_token="discord-bot-token",
+            alert_channel_id="ch-alert",
+            info_channel_id="ch-info",
+            health_channel_id="ch-health",
+            wealth_channel_id="ch-wealth",
+            default_user_id="user-1",
+            confidence_threshold=confidence_threshold,
+        ),
+        discord=resolved_discord,
+        jev=resolved_jev,
+        clock=FakeClock(),
+    )
+    pipeline = InboundEmailPipeline(
+        config=InboundConfig(
+            confidence_threshold=confidence_threshold,
+            plutus_dispatch_enabled=plutus_dispatch_enabled,
+            chronos_dispatch_enabled=chronos_dispatch_enabled,
+        ),
+        jev=resolved_jev,
+        consumers={"plutus": resolved_plutus, "chronos": resolved_chronos},
+        alerter=alerter,
+    )
+    return pipeline, resolved_jev, resolved_plutus, resolved_chronos, resolved_discord
+
+
+def test_questions_include_has_schedule_event_and_calendar_attachment_helper() -> None:
+    questions = build_inbound_email_questions()
+    assert list(questions.keys()) == [
+        "route_target",
+        "has_actionable_amount",
+        "has_schedule_event",
+        "significance_score",
+    ]
+    assert questions["has_schedule_event"]["type"] == "noul"
+    assert ".ics" in questions["has_schedule_event"]["instructions"].lower()
+
+    assert has_calendar_attachment([]) is False
+    assert has_calendar_attachment([{"filename": "receipt.pdf", "content_type": "application/pdf"}]) is False
+    assert has_calendar_attachment([{"filename": "invite.ics", "content_type": "application/octet-stream"}]) is True
+    assert has_calendar_attachment([{"filename": "event.dat", "content_type": "text/calendar; charset=utf-8"}]) is True
+
+
+@pytest.mark.asyncio
+async def test_http_consumer_dispatch_adapter_chronos_statuses_and_errors() -> None:
+    captured: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    responses: list[httpx.Response | Exception] = [
+        httpx.Response(201, json={"status": "created", "consumer_ref": "chronos-evt-88"}),
+        httpx.Response(200, json={"status": "duplicate", "consumer_ref": "chronos-evt-88"}),
+        httpx.Response(422, text="invalid schedule payload"),
+        httpx.Response(503, text="chronos db unavailable"),
+        httpx.ConnectError("connection refused"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(
+            (str(request.url), dict(request.headers), json.loads(request.content.decode("utf-8")))
+        )
+        outcome = responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    adapter = HttpConsumerDispatchAdapter(
+        ConsumerConfig(
+            consumer_name="chronos",
+            api_url="http://chronos-api:8000",
+            webhook_secret="chronos-secret-token",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    assert isinstance(adapter, ConsumerDispatchPort)
+    req = ConsumerDispatchRequest(
+        email_id=202,
+        message_id="<cal-1@example.com>",
+        route_target="actionable_notice",
+        from_address="clinic@example.com",
+        to_address="iris@example.com",
+        subject="Dentist Checkup",
+        received_at=datetime(2026, 11, 26, 2, 0, tzinfo=timezone.utc),
+        text_body="Appointment at 14:00.",
+        html_excerpt=None,
+        raw_excerpt="Appointment at 14:00.",
+        jev_verdict={"route_target": "actionable_notice", "has_schedule_event": True},
+        attachments=(),
+    )
+
+    res_created = await adapter.dispatch_email(req)
+    assert res_created == ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-88")
+    assert captured[0][0] == "http://chronos-api:8000/integrations/email"
+    assert captured[0][1]["authorization"] == "Bearer chronos-secret-token"
+
+    res_dup = await adapter.dispatch_email(req)
+    assert res_dup == ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-88")
+
+    res_422 = await adapter.dispatch_email(req)
+    assert res_422.status == "rejected"
+    assert "chronos_validation_422" in (res_422.error_detail or "")
+
+    res_503 = await adapter.dispatch_email(req)
+    assert res_503.status == "unavailable"
+    assert "chronos_upstream_503" in (res_503.error_detail or "")
+
+    res_net = await adapter.dispatch_email(req)
+    assert res_net.status == "unavailable"
+    assert "chronos_network_error" in (res_net.error_detail or "")
+
+    unconfigured = HttpConsumerDispatchAdapter(
+        ConsumerConfig(consumer_name="chronos", api_url="", webhook_secret=None)
+    )
+    res_unconf = await unconfigured.dispatch_email(req)
+    assert res_unconf.status == "unavailable"
+    assert res_unconf.error_detail == (
+        "chronos_dispatch_misconfigured: missing CHRONOS_API_URL, CHRONOS_WEBHOOK_SECRET"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confidence_isolation_uncertain_schedule_does_not_park_plutus_receipt(
+    db_session: Session,
+) -> None:
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "has_schedule_event": True,
+            "significance_score": 8,
+            "_confidence": 0.52,
+            "_question_confidence": {
+                "route_target": 0.95,
+                "has_actionable_amount": 0.91,
+                "has_schedule_event": 0.52,
+                "significance_score": 0.88,
+            },
+        }
+    )
+    pipeline, _, plutus, chronos, _ = _make_multi_pipeline(jev=jev)
+
+    res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<iso-conf-1@example.com>",
+            from_address="orders@shop.example",
+            to_address="iris@example.com",
+            subject="Order Receipt",
+            text_body="Order total NZD 49.00. Estimated delivery next Tuesday.",
+        ),
+    )
+    assert res.disposition == "dispatched"
+    assert res.email.dispatch_status == "dispatched"
+    assert res.email.jev_verdict is not None
+    assert res.email.jev_verdict["confidence"] == pytest.approx(0.91)
+    assert res.email.jev_verdict["has_schedule_event"] is False
+    assert res.email.jev_verdict["schedule_confidence"] == pytest.approx(0.52)
+    assert len(plutus.requests) == 1
+    assert chronos.requests == []
+
+
+@pytest.mark.asyncio
+async def test_dual_match_partial_failure_retry_skips_already_dispatched_consumer(
+    db_session: Session,
+) -> None:
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "has_schedule_event": True,
+            "significance_score": 8,
+            "_question_confidence": {
+                "route_target": 0.96,
+                "has_actionable_amount": 0.94,
+                "has_schedule_event": 0.93,
+            },
+        }
+    )
+    plutus = InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-tx-502")
+    )
+    chronos = InMemoryConsumerDispatcher(
+        responses=[
+            ConsumerDispatchResult(status="unavailable", error_detail="chronos_upstream_503: timeout"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-502"),
+        ]
+    )
+    pipeline, _, _, _, discord = _make_multi_pipeline(jev=jev, plutus=plutus, chronos=chronos)
+
+    first_res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<dual-retry-502@example.com>",
+            from_address="bookings@airline.example",
+            to_address="iris@example.com",
+            subject="Flight NZ502 to Wellington",
+            text_body="Total paid NZD 245.00. Departing 2026-12-01 09:30.",
+        ),
+    )
+    assert first_res.disposition == "failed"
+    assert first_res.delivery_unavailable is True
+    assert first_res.email.dispatch_status == "failed"
+    assert "chronos_upstream_503" in (first_res.email.error_detail or "")
+    assert len(discord.posts) == 1
+    assert discord.posts[0].channel_id == "ch-alert"
+    deliveries_after_ingest = {d.consumer: d for d in first_res.email.deliveries}
+    assert deliveries_after_ingest["plutus"].dispatch_status == "dispatched"
+    assert deliveries_after_ingest["plutus"].consumer_ref == "plutus-tx-502"
+    assert deliveries_after_ingest["chronos"].dispatch_status == "failed"
+    assert deliveries_after_ingest["chronos"].retry_count == 0
+
+    retry_res = await pipeline.retry(db_session, first_res.email.id, reclassify=False)
+    assert retry_res.disposition == "dispatched"
+    assert retry_res.delivery_unavailable is False
+    assert retry_res.email.dispatch_status == "dispatched"
+    assert retry_res.email.error_detail is None
+    assert retry_res.email.consumer_ref == "plutus:plutus-tx-502, chronos:chronos-evt-502"
+    assert len(plutus.requests) == 1
+    assert len(chronos.requests) == 2
+    assert len(discord.posts) == 1
+    deliveries_after_retry = {d.consumer: d for d in retry_res.email.deliveries}
+    assert deliveries_after_retry["plutus"].retry_count == 0
+    assert deliveries_after_retry["chronos"].dispatch_status == "dispatched"
+    assert deliveries_after_retry["chronos"].consumer_ref == "chronos-evt-502"
+    assert deliveries_after_retry["chronos"].retry_count == 1
+
 

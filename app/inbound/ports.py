@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Protocol, runtim
 if TYPE_CHECKING:
     from app.db.models import InboundEmail
 
-PlutusDispatchStatus = Literal["dispatched", "rejected", "unavailable"]
+ConsumerName = Literal["plutus", "chronos"]
+ConsumerDispatchStatus = Literal["dispatched", "rejected", "unavailable"]
+PlutusDispatchStatus = ConsumerDispatchStatus
 InboundDisposition = Literal["dispatched", "duplicate", "ignored", "needs_review", "failed"]
 
 
@@ -21,6 +23,17 @@ class InvalidRouteTargetError(ValueError):
 class InboundConfig:
     confidence_threshold: float = 0.80
     plutus_dispatch_enabled: bool = False
+    chronos_dispatch_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class ConsumerConfig:
+    consumer_name: str
+    api_url: str
+    webhook_secret: Optional[str]
+    url_env_name: str = ""
+    secret_env_name: str = ""
+    timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -31,7 +44,7 @@ class PlutusConfig:
 
 
 @dataclass(frozen=True)
-class PlutusAttachmentPayload:
+class ConsumerAttachmentPayload:
     filename: str
     content_type: str
     size_bytes: int
@@ -39,8 +52,11 @@ class PlutusAttachmentPayload:
     content_base64: str
 
 
+PlutusAttachmentPayload = ConsumerAttachmentPayload
+
+
 @dataclass(frozen=True)
-class PlutusDispatchRequest:
+class ConsumerDispatchRequest:
     email_id: int
     message_id: str
     route_target: str
@@ -52,14 +68,20 @@ class PlutusDispatchRequest:
     html_excerpt: Optional[str]
     raw_excerpt: Optional[str]
     jev_verdict: Optional[Dict[str, Any]]
-    attachments: tuple[PlutusAttachmentPayload, ...]
+    attachments: tuple[ConsumerAttachmentPayload, ...]
+
+
+PlutusDispatchRequest = ConsumerDispatchRequest
 
 
 @dataclass(frozen=True)
-class PlutusDispatchResult:
-    status: PlutusDispatchStatus
+class ConsumerDispatchResult:
+    status: ConsumerDispatchStatus
     consumer_ref: Optional[str] = None
     error_detail: Optional[str] = None
+
+
+PlutusDispatchResult = ConsumerDispatchResult
 
 
 @dataclass(frozen=True)
@@ -71,6 +93,9 @@ class InboundActionResult:
 
 
 @runtime_checkable
-class PlutusDispatchPort(Protocol):
-    async def dispatch_email(self, request: PlutusDispatchRequest) -> PlutusDispatchResult:
-        """Dispatch a routed financial email payload to the Plutus consumer."""
+class ConsumerDispatchPort(Protocol):
+    async def dispatch_email(self, request: ConsumerDispatchRequest) -> ConsumerDispatchResult:
+        """Dispatch a routed inbound email payload to a downstream consumer."""
+
+
+PlutusDispatchPort = ConsumerDispatchPort
