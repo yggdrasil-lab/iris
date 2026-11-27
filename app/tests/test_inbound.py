@@ -38,7 +38,7 @@ from app.inbound import (
     has_document_attachment,
 )
 from app.jev import JevConfig, JevRouterUnavailableError, MuninnJevAdapter
-from app.models.schemas import InboundEmailWebhookPayload, RouteTargetType
+from app.models.schemas import EmailRouteVerdict, InboundEmailWebhookPayload, RouteTargetType
 from app.tests.conftest import IrisTestHarness
 from app.tests.fakes import (
     FakeClock,
@@ -107,6 +107,7 @@ def test_inbound_email_questions_cover_travel_receipts_payslips_and_attachments(
     questions = build_inbound_email_questions()
     route_criteria = questions["route_target"]["criteria"]
     receipt_criteria = route_criteria["plutus_purchase_receipt"]
+    ignore_criteria = route_criteria["ignore"]
     notice_criteria = route_criteria["actionable_notice"]
     payslip_criteria = route_criteria["plutus_payslip"]
     amount_instructions = questions["has_actionable_amount"]["instructions"]
@@ -118,9 +119,19 @@ def test_inbound_email_questions_cover_travel_receipts_payslips_and_attachments(
     assert "deposit receipt" in receipt_criteria.lower()
     assert "tax invoice" in receipt_criteria.lower()
     assert "e-commerce order confirmation" in receipt_criteria.lower()
+    assert "shipment/dispatch confirmation" in receipt_criteria.lower()
+    assert "amazon ordered or shipped" in receipt_criteria.lower()
+    assert "total dollar amount" in receipt_criteria.lower()
     assert "forwarded purchase receipt" in receipt_criteria.lower()
     assert "TaxInvoice.pdf" in receipt_criteria
     assert "SI_*.jpg" in receipt_criteria
+
+    assert "pure shipping or delivery tracking update" in ignore_criteria.lower()
+    assert "exclude retailer shipped/dispatched emails" in ignore_criteria.lower()
+    assert "total dollar amount" in ignore_criteria.lower()
+
+    tier1_criteria = questions["significance_score"]["criteria"][0]
+    assert "without a purchase total" in tier1_criteria.lower()
 
     assert "travel booking" not in notice_criteria.lower()
     assert "without a paid purchase receipt" in notice_criteria.lower()
@@ -1489,5 +1500,109 @@ async def test_odysseus_disabled_reason_and_kwarg_registration(
     assert enabled_res.disposition == "dispatched"
     assert enabled_res.email.consumer_ref == "booking:bk-kwarg"
     assert len(odysseus.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_classify_and_ingest_persists_question_confidence_and_legacy_schema(
+    db_session: Session,
+) -> None:
+    legacy_verdict = EmailRouteVerdict.model_validate(
+        {
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "confidence": 0.89,
+            "urgency_score": 7,
+            "reason": "Legacy verdict without question_confidence",
+            "provider": "muninn-jev",
+        }
+    )
+    assert legacy_verdict.question_confidence is None
+
+    with_qconf_jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "has_schedule_event": False,
+            "has_travel_booking": False,
+            "significance_score": 8,
+            "_confidence": 0.72,
+            "_question_confidence": {
+                "route_target": 0.94,
+                "has_actionable_amount": 0.91,
+                "has_schedule_event": 0.99,
+                "has_travel_booking": 0.98,
+                "significance_score": 0.88,
+            },
+        }
+    )
+    pipeline_with_qconf, _, plutus, _, _ = _make_multi_pipeline(jev=with_qconf_jev)
+    classified = await pipeline_with_qconf.classify_email(
+        from_address="shipment-tracking@amazon.com.au",
+        to_address="iris@example.com",
+        subject='Shipped: "Example USB Cable"',
+        received_at="2026-11-27T10:00:00Z",
+        raw_excerpt="Your order has shipped. Total: AUD 67.78",
+        attachments_meta=[],
+    )
+    assert classified.question_confidence == {
+        "route_target": pytest.approx(0.94),
+        "has_actionable_amount": pytest.approx(0.91),
+        "has_schedule_event": pytest.approx(0.99),
+        "has_travel_booking": pytest.approx(0.98),
+        "significance_score": pytest.approx(0.88),
+    }
+
+    ingested = await pipeline_with_qconf.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<amazon-shipped-qconf-1@example.com>",
+            from_address="shipment-tracking@amazon.com.au",
+            to_address="iris@example.com",
+            subject='Shipped: "Example USB Cable"',
+            text_body="Your order has shipped. Total: AUD 67.78",
+        ),
+    )
+    assert ingested.disposition == "dispatched"
+    assert len(plutus.requests) == 1
+    assert ingested.email.jev_verdict is not None
+    assert ingested.email.jev_verdict["question_confidence"] == {
+        "route_target": pytest.approx(0.94),
+        "has_actionable_amount": pytest.approx(0.91),
+        "has_schedule_event": pytest.approx(0.99),
+        "has_travel_booking": pytest.approx(0.98),
+        "significance_score": pytest.approx(0.88),
+    }
+
+    without_qconf_jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "significance_score": 8,
+            "_confidence": 0.90,
+        }
+    )
+    pipeline_without_qconf, _, _, _, _ = _make_multi_pipeline(jev=without_qconf_jev)
+    classified_no_qconf = await pipeline_without_qconf.classify_email(
+        from_address="orders@shop.example",
+        to_address="iris@example.com",
+        subject="Order Confirmation",
+        received_at="2026-11-27T11:00:00Z",
+        raw_excerpt="Total: AUD 19.95",
+        attachments_meta=[],
+    )
+    assert classified_no_qconf.question_confidence is None
+
+    ingested_no_qconf = await pipeline_without_qconf.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<amazon-shipped-no-qconf-1@example.com>",
+            from_address="orders@shop.example",
+            to_address="iris@example.com",
+            subject="Order Confirmation",
+            text_body="Total: AUD 19.95",
+        ),
+    )
+    assert ingested_no_qconf.email.jev_verdict is not None
+    assert ingested_no_qconf.email.jev_verdict["question_confidence"] is None
 
 

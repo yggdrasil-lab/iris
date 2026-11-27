@@ -40,7 +40,8 @@ ROUTE_CATALOG: Dict[str, RouteSpec] = {
     "plutus_purchase_receipt": RouteSpec(
         target="plutus_purchase_receipt",
         jev_criteria=(
-            "E-commerce order confirmation (e.g., Amazon), tax invoice, flight itinerary or airline e-ticket receipt, "
+            "E-commerce order confirmation or shipment/dispatch confirmation containing itemized prices or an order total "
+            "(e.g., Amazon Ordered or Shipped emails with a Total dollar amount), tax invoice, flight itinerary or airline e-ticket receipt, "
             "hotel or travel booking payment confirmation or deposit receipt, or forwarded purchase receipt "
             "(containing an itemized or total spend, or emails with attached invoice/receipt PDFs or images such as TaxInvoice.pdf or SI_*.jpg)"
         ),
@@ -92,7 +93,11 @@ ROUTE_CATALOG: Dict[str, RouteSpec] = {
     ),
     "ignore": RouteSpec(
         target="ignore",
-        jev_criteria="Shipping tracking update without purchase total, marketing promo, newsletter, OTP login code, or low-value noise",
+        jev_criteria=(
+            "Pure shipping or delivery tracking update with NO itemized prices or purchase total "
+            "(exclude retailer Shipped/dispatched emails that include a Total dollar amount), "
+            "marketing promo, newsletter, OTP login code, or low-value noise"
+        ),
         dispatches_to_plutus=False,
     ),
 }
@@ -127,7 +132,7 @@ _TRAVEL_BOOKING_INSTRUCTIONS = (
 )
 
 _SIGNIFICANCE_SCORE_CRITERIA = [
-    "Marketing promo, newsletter, OTP code, or shipping tracking noise with no financial or action relevance",
+    "Marketing promo, newsletter, OTP code, or shipping tracking noise without a purchase total or action relevance",
     "Low-priority informational email without urgent financial or operator action",
     "Valid bank alert, purchase receipt, payslip, or financial statement ready for ingestion",
     "High-priority financial charge, large transfer, overdue bill, or urgent actionable notice",

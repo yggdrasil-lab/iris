@@ -51,6 +51,19 @@ def parse_clamped_confidence(value: Any) -> float:
     return max(0.0, min(1.0, numeric))
 
 
+def extract_question_confidences(parsed: Mapping[str, Any]) -> Optional[Dict[str, float]]:
+    """Extract and clamp per-question Jev confidences from _question_confidence."""
+    question_conf = parsed.get("_question_confidence")
+    if not isinstance(question_conf, Mapping):
+        return None
+    confidences = {
+        key: parse_clamped_confidence(value)
+        for key, value in question_conf.items()
+        if isinstance(key, str) and value is not None
+    }
+    return confidences or None
+
+
 def resolve_calibrated_confidence(
     parsed: Mapping[str, Any],
     *,

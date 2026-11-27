@@ -39,6 +39,7 @@ from app.inbound.sanitizer import (
 from app.jev import (
     JevClientPort,
     JevRouterUnavailableError,
+    extract_question_confidences,
     parse_bool,
     parse_clamped_score,
     resolve_calibrated_confidence,
@@ -366,6 +367,7 @@ class InboundEmailPipeline:
             has_travel_booking=has_travel,
             travel_confidence=travel_conf,
             confidence=conf,
+            question_confidence=extract_question_confidences(parsed),
             urgency_score=score,
             reason=(
                 f"Jev classified as {route_target} "
