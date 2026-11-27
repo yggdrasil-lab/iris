@@ -34,6 +34,7 @@ class EmailRouteVerdict(BaseModel):
     has_travel_booking: bool = False
     travel_confidence: Optional[float] = None
     confidence: float
+    question_confidence: Optional[Dict[str, float]] = None
     urgency_score: int
     reason: str
     provider: str

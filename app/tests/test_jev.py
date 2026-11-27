@@ -10,6 +10,7 @@ from app.jev import (
     JevConfig,
     JevRouterUnavailableError,
     MuninnJevAdapter,
+    extract_question_confidences,
     parse_bool,
     parse_clamped_confidence,
     parse_clamped_score,
@@ -59,6 +60,36 @@ def test_parsing_and_calibrated_confidence_helpers() -> None:
         == pytest.approx(0.74)
     )
     assert resolve_calibrated_confidence({}) == 0.0
+
+
+def test_extract_question_confidences() -> None:
+    assert extract_question_confidences({}) is None
+    assert extract_question_confidences({"_question_confidence": ["not-a-mapping"]}) is None
+    assert extract_question_confidences({"_question_confidence": {}}) is None
+    assert extract_question_confidences({"_question_confidence": {"route_target": None}}) is None
+
+    extracted = extract_question_confidences(
+        {
+            "_question_confidence": {
+                "route_target": 1.35,
+                "has_actionable_amount": "0.91",
+                "has_schedule_event": -0.25,
+                "has_travel_booking": None,
+                "bool_val": True,
+                "nan_val": "nan",
+                "inf_val": float("inf"),
+                123: 0.99,
+            }
+        }
+    )
+    assert extracted == {
+        "route_target": pytest.approx(1.0),
+        "has_actionable_amount": pytest.approx(0.91),
+        "has_schedule_event": pytest.approx(0.0),
+        "bool_val": pytest.approx(0.0),
+        "nan_val": pytest.approx(0.0),
+        "inf_val": pytest.approx(0.0),
+    }
 
 
 @pytest.mark.asyncio

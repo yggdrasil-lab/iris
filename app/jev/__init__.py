@@ -1,6 +1,7 @@
 from app.jev.client import (
     JEV_USER_AGENT,
     MuninnJevAdapter,
+    extract_question_confidences,
     parse_bool,
     parse_clamped_confidence,
     parse_clamped_score,
@@ -18,6 +19,7 @@ __all__ = [
     "JevConfig",
     "JevRouterUnavailableError",
     "MuninnJevAdapter",
+    "extract_question_confidences",
     "parse_bool",
     "parse_clamped_confidence",
     "parse_clamped_score",
