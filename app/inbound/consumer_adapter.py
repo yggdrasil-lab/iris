@@ -40,6 +40,16 @@ def _serialize_payload(request: ConsumerDispatchRequest) -> Dict[str, Any]:
     }
 
 
+_CONSUMER_REF_KEYS = (
+    "consumer_ref",
+    "booking_id",
+    "event_id",
+    "transaction_id",
+    "receipt_id",
+    "status",
+)
+
+
 def _extract_consumer_ref(resp: httpx.Response) -> str:
     try:
         body = resp.json()
@@ -47,15 +57,11 @@ def _extract_consumer_ref(resp: httpx.Response) -> str:
         body = {}
     if not isinstance(body, dict):
         return "dispatched"
-    consumer_ref = (
-        body.get("consumer_ref")
-        or body.get("event_id")
-        or body.get("transaction_id")
-        or body.get("receipt_id")
-        or body.get("status")
-        or "dispatched"
-    )
-    return str(consumer_ref)[:256]
+    for key in _CONSUMER_REF_KEYS:
+        value = body.get(key)
+        if value:
+            return str(value)[:256]
+    return "dispatched"
 
 
 class HttpConsumerDispatchAdapter:

@@ -95,6 +95,8 @@ def test_route_catalog_integrity_and_plutus_targets() -> None:
         "plutus_payslip",
         "plutus_bank_statement",
     }
+    assert get_route_spec("travel_booking").dispatches_to_plutus is False
+    assert get_route_spec("travel_booking").fanout_targets == ("odysseus",)
     assert get_route_spec("actionable_notice").dispatches_to_plutus is False
     assert get_route_spec("ignore").dispatches_to_plutus is False
     with pytest.raises(InvalidRouteTargetError, match="Unsupported route_target"):
@@ -821,9 +823,11 @@ def _make_multi_pipeline(
     confidence_threshold: float = 0.80,
     plutus_dispatch_enabled: bool = True,
     chronos_dispatch_enabled: bool = True,
+    odysseus_dispatch_enabled: bool = True,
     jev: InMemoryJevClient | None = None,
     plutus: InMemoryConsumerDispatcher | None = None,
     chronos: InMemoryConsumerDispatcher | None = None,
+    odysseus: InMemoryConsumerDispatcher | None = None,
     discord: InMemoryDiscordTransport | None = None,
 ) -> tuple[
     InboundEmailPipeline,
@@ -838,6 +842,9 @@ def _make_multi_pipeline(
     )
     resolved_chronos = chronos or InMemoryConsumerDispatcher(
         default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-1")
+    )
+    resolved_odysseus = odysseus or InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="booking:odysseus-1")
     )
     resolved_discord = discord or InMemoryDiscordTransport()
     alerter = OutboundAlerter(
@@ -859,9 +866,14 @@ def _make_multi_pipeline(
             confidence_threshold=confidence_threshold,
             plutus_dispatch_enabled=plutus_dispatch_enabled,
             chronos_dispatch_enabled=chronos_dispatch_enabled,
+            odysseus_dispatch_enabled=odysseus_dispatch_enabled,
         ),
         jev=resolved_jev,
-        consumers={"plutus": resolved_plutus, "chronos": resolved_chronos},
+        consumers={
+            "plutus": resolved_plutus,
+            "chronos": resolved_chronos,
+            "odysseus": resolved_odysseus,
+        },
         alerter=alerter,
     )
     return pipeline, resolved_jev, resolved_plutus, resolved_chronos, resolved_discord
@@ -873,10 +885,13 @@ def test_questions_include_has_schedule_event_and_calendar_attachment_helper() -
         "route_target",
         "has_actionable_amount",
         "has_schedule_event",
+        "has_travel_booking",
         "significance_score",
     ]
     assert questions["has_schedule_event"]["type"] == "noul"
     assert ".ics" in questions["has_schedule_event"]["instructions"].lower()
+    assert questions["has_travel_booking"]["type"] == "noul"
+    assert "travel" in questions["has_travel_booking"]["instructions"].lower()
 
     assert has_calendar_attachment([]) is False
     assert has_calendar_attachment([{"filename": "receipt.pdf", "content_type": "application/pdf"}]) is False
@@ -1063,5 +1078,416 @@ async def test_dual_match_partial_failure_retry_skips_already_dispatched_consume
     assert deliveries_after_retry["chronos"].dispatch_status == "dispatched"
     assert deliveries_after_retry["chronos"].consumer_ref == "chronos-evt-502"
     assert deliveries_after_retry["chronos"].retry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_http_consumer_dispatch_adapter_extracts_odysseus_consumer_ref_and_booking_id() -> None:
+    captured: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    responses = [
+        httpx.Response(
+            201,
+            json={
+                "status": "staged",
+                "duplicate": False,
+                "booking_id": "11111111-1111-1111-1111-111111111111",
+                "consumer_ref": "booking:11111111-1111-1111-1111-111111111111",
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "status": "duplicate",
+                "duplicate": True,
+                "booking_id": "22222222-2222-2222-2222-222222222222",
+            },
+        ),
+        httpx.Response(422, text="invalid travel payload"),
+        httpx.Response(503, text="odysseus unavailable"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(
+            (str(request.url), dict(request.headers), json.loads(request.content.decode("utf-8")))
+        )
+        return responses.pop(0)
+
+    adapter = HttpConsumerDispatchAdapter(
+        ConsumerConfig(
+            consumer_name="odysseus",
+            api_url="http://odysseus-api:8000",
+            webhook_secret="odysseus-secret-token",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    req = ConsumerDispatchRequest(
+        email_id=301,
+        message_id="<odysseus-ref-1@example.com>",
+        route_target="travel_booking",
+        from_address="bookings@hotel.example",
+        to_address="iris@example.com",
+        subject="Hotel Reservation Confirmed",
+        received_at=datetime(2026, 11, 27, 4, 0, tzinfo=timezone.utc),
+        text_body="Pay at property reservation for Alex Tan.",
+        html_excerpt=None,
+        raw_excerpt="Pay at property reservation for Alex Tan.",
+        jev_verdict={"route_target": "travel_booking", "has_travel_booking": True},
+        attachments=(),
+    )
+
+    res_created = await adapter.dispatch_email(req)
+    assert res_created == ConsumerDispatchResult(
+        status="dispatched",
+        consumer_ref="booking:11111111-1111-1111-1111-111111111111",
+    )
+    assert captured[0][0] == "http://odysseus-api:8000/integrations/email"
+    assert captured[0][1]["authorization"] == "Bearer odysseus-secret-token"
+    assert captured[0][1]["user-agent"] == "Yggdrasil-Iris/1.0"
+    assert captured[0][2]["email_id"] == 301
+    assert captured[0][2]["route_target"] == "travel_booking"
+    assert captured[0][2]["attachments"] == []
+
+    res_dup = await adapter.dispatch_email(req)
+    assert res_dup == ConsumerDispatchResult(
+        status="dispatched",
+        consumer_ref="22222222-2222-2222-2222-222222222222",
+    )
+
+    res_422 = await adapter.dispatch_email(req)
+    assert res_422.status == "rejected"
+    assert "odysseus_validation_422" in (res_422.error_detail or "")
+
+    res_503 = await adapter.dispatch_email(req)
+    assert res_503.status == "unavailable"
+    assert "odysseus_upstream_503" in (res_503.error_detail or "")
+
+
+@pytest.mark.asyncio
+async def test_odysseus_only_travel_booking_dispatches_without_amount_and_blocks_low_confidence(
+    db_session: Session,
+) -> None:
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "travel_booking",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 6,
+                "_confidence": 0.91,
+            },
+            {
+                "route_target": "travel_booking",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 4,
+                "_confidence": 0.55,
+            },
+        ]
+    )
+    odysseus = InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-301")
+    )
+    pipeline, _, plutus, chronos, discord = _make_multi_pipeline(jev=jev, odysseus=odysseus)
+
+    ok_res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<travel-only-1@example.com>",
+            from_address="reservations@hotel.example",
+            to_address="iris@example.com",
+            subject="Booking Confirmation - Pay at Property",
+            text_body="Reservation for Alex Tan, check-in 2026-12-10.",
+        ),
+    )
+    assert ok_res.disposition == "dispatched"
+    assert ok_res.email.route_target == "travel_booking"
+    assert ok_res.email.consumer_ref == "booking:bk-301"
+    assert [d.consumer for d in ok_res.email.deliveries] == ["odysseus"]
+    assert len(odysseus.requests) == 1
+    assert plutus.requests == []
+    assert chronos.requests == []
+
+    low_res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<travel-low-conf@example.com>",
+            from_address="info@promo.example",
+            to_address="iris@example.com",
+            subject="Maybe a Trip Update",
+            text_body="Explore winter deals.",
+        ),
+    )
+    assert low_res.disposition == "needs_review"
+    assert "low_confidence" in (low_res.email.error_detail or "")
+    assert len(odysseus.requests) == 1
+    assert len(discord.posts) == 1
+    assert discord.posts[0].channel_id == "ch-info"
+
+
+@pytest.mark.asyncio
+async def test_odysseus_confidence_isolation_and_plutus_evidence_guard_secondary_fanout(
+    db_session: Session,
+) -> None:
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": True,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 8,
+                "_question_confidence": {
+                    "route_target": 0.95,
+                    "has_actionable_amount": 0.91,
+                    "has_travel_booking": 0.52,
+                },
+            },
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 7,
+                "_question_confidence": {
+                    "route_target": 0.92,
+                    "has_actionable_amount": 0.90,
+                    "has_travel_booking": 0.91,
+                },
+            },
+        ]
+    )
+    odysseus = InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-guard-1")
+    )
+    pipeline, _, plutus, _, _ = _make_multi_pipeline(jev=jev, odysseus=odysseus)
+
+    iso_res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<odysseus-iso-1@example.com>",
+            from_address="orders@shop.example",
+            to_address="iris@example.com",
+            subject="Luggage Purchase Receipt",
+            text_body="Paid NZD 199.00 for carry-on suitcase.",
+        ),
+    )
+    assert iso_res.disposition == "dispatched"
+    assert iso_res.email.jev_verdict is not None
+    assert iso_res.email.jev_verdict["confidence"] == pytest.approx(0.91)
+    assert iso_res.email.jev_verdict["has_travel_booking"] is False
+    assert iso_res.email.jev_verdict["travel_confidence"] == pytest.approx(0.52)
+    assert len(plutus.requests) == 1
+    assert odysseus.requests == []
+
+    guard_res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<plutus-guard-odysseus-1@example.com>",
+            from_address="bookings@airline.example",
+            to_address="iris@example.com",
+            subject="Flight Itinerary Without Total",
+            text_body="Booking ref ABC123 for Alex Tan.",
+        ),
+    )
+    assert guard_res.disposition == "needs_review"
+    assert guard_res.email.error_detail == "receipt_missing_actionable_amount"
+    assert len(plutus.requests) == 1
+    assert len(odysseus.requests) == 1
+    assert {d.consumer: d.dispatch_status for d in guard_res.email.deliveries} == {
+        "odysseus": "dispatched",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dual_plutus_odysseus_partial_failure_retry_and_manual_reroute(
+    db_session: Session,
+) -> None:
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": True,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 8,
+                "_question_confidence": {
+                    "route_target": 0.96,
+                    "has_actionable_amount": 0.94,
+                    "has_travel_booking": 0.93,
+                },
+            },
+            {
+                "route_target": "ignore",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "has_travel_booking": False,
+                "significance_score": 2,
+                "_confidence": 0.91,
+            },
+            {
+                "route_target": "travel_booking",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 5,
+                "_confidence": 0.55,
+            },
+        ]
+    )
+    plutus = InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-tx-777")
+    )
+    odysseus = InMemoryConsumerDispatcher(
+        responses=[
+            ConsumerDispatchResult(status="unavailable", error_detail="odysseus_upstream_503: timeout"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-777"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-reroute"),
+        ]
+    )
+    pipeline, _, _, _, _ = _make_multi_pipeline(jev=jev, plutus=plutus, odysseus=odysseus)
+
+    first_res = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<dual-odysseus-777@example.com>",
+            from_address="bookings@airline.example",
+            to_address="iris@example.com",
+            subject="Flight NZ777 Receipt",
+            text_body="Total paid NZD 420.00 for Alex Tan.",
+        ),
+    )
+    assert first_res.disposition == "failed"
+    assert first_res.delivery_unavailable is True
+    assert "odysseus_upstream_503" in (first_res.email.error_detail or "")
+    assert len(plutus.requests) == 1
+    assert len(odysseus.requests) == 1
+    first_deliveries = {d.consumer: d for d in first_res.email.deliveries}
+    assert first_deliveries["plutus"].dispatch_status == "dispatched"
+    assert first_deliveries["odysseus"].dispatch_status == "failed"
+    assert first_deliveries["odysseus"].retry_count == 0
+
+    retry_res = await pipeline.retry(db_session, first_res.email.id, reclassify=False)
+    assert retry_res.disposition == "dispatched"
+    assert retry_res.email.consumer_ref == "plutus:plutus-tx-777, odysseus:booking:bk-777"
+    assert len(plutus.requests) == 1
+    assert len(odysseus.requests) == 2
+    retry_deliveries = {d.consumer: d for d in retry_res.email.deliveries}
+    assert {k: v.dispatch_status for k, v in retry_deliveries.items()} == {
+        "plutus": "dispatched",
+        "odysseus": "dispatched",
+    }
+    assert retry_deliveries["plutus"].retry_count == 0
+    assert retry_deliveries["odysseus"].retry_count == 1
+
+    reroute_source = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<reroute-travel-src@example.com>",
+            from_address="bookings@rail.example",
+            to_address="iris@example.com",
+            subject="Rail Pass Confirmation",
+            text_body="Pass issued for Alex Tan.",
+        ),
+    )
+    assert reroute_source.disposition == "ignored"
+    rerouted_travel = await pipeline.reroute(
+        db_session, reroute_source.email.id, new_target="travel_booking"
+    )
+    assert rerouted_travel.disposition == "dispatched"
+    assert rerouted_travel.email.route_target == "travel_booking"
+    assert rerouted_travel.email.consumer_ref == "booking:bk-reroute"
+    assert len(odysseus.requests) == 3
+
+    low_conf_travel = await pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<reroute-ignore-src@example.com>",
+            from_address="promo@travel.example",
+            to_address="iris@example.com",
+            subject="Low-Confidence Travel Email",
+            text_body="Explore deals.",
+        ),
+    )
+    assert low_conf_travel.disposition == "needs_review"
+    assert len(odysseus.requests) == 3
+
+    rerouted_ignore = await pipeline.reroute(
+        db_session, low_conf_travel.email.id, new_target="ignore"
+    )
+    assert rerouted_ignore.disposition == "ignored"
+    assert len(odysseus.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_odysseus_disabled_reason_and_kwarg_registration(
+    db_session: Session,
+) -> None:
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "travel_booking",
+            "has_actionable_amount": False,
+            "has_schedule_event": False,
+            "has_travel_booking": True,
+            "significance_score": 6,
+            "_confidence": 0.92,
+        }
+    )
+    odysseus = InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-kwarg")
+    )
+    discord = InMemoryDiscordTransport()
+    alerter = OutboundAlerter(
+        config=AlertingConfig(
+            bot_token="discord-bot-token",
+            alert_channel_id="ch-alert",
+            info_channel_id="ch-info",
+            health_channel_id="ch-health",
+            wealth_channel_id="ch-wealth",
+            default_user_id="user-1",
+        ),
+        discord=discord,
+        jev=jev,
+        clock=FakeClock(),
+    )
+    disabled_pipeline = InboundEmailPipeline(
+        config=InboundConfig(odysseus_dispatch_enabled=False),
+        jev=jev,
+        odysseus=odysseus,
+        alerter=alerter,
+    )
+    disabled_res = await disabled_pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<odysseus-disabled-1@example.com>",
+            from_address="bookings@ferry.example",
+            to_address="iris@example.com",
+            subject="Ferry Crossing Confirmation",
+            text_body="Reservation for Alex Tan.",
+        ),
+    )
+    assert disabled_res.disposition == "needs_review"
+    assert disabled_res.email.error_detail == "odysseus_dispatch_disabled"
+    assert odysseus.requests == []
+
+    enabled_pipeline = InboundEmailPipeline(
+        config=InboundConfig(odysseus_dispatch_enabled=True),
+        jev=jev,
+        odysseus=odysseus,
+        alerter=alerter,
+    )
+    enabled_res = await enabled_pipeline.ingest(
+        db_session,
+        InboundEmailWebhookPayload(
+            message_id="<odysseus-kwarg-1@example.com>",
+            from_address="bookings@ferry.example",
+            to_address="iris@example.com",
+            subject="Ferry Boarding Pass",
+            text_body="Boarding pass for Alex Tan.",
+        ),
+    )
+    assert enabled_res.disposition == "dispatched"
+    assert enabled_res.email.consumer_ref == "booking:bk-kwarg"
+    assert len(odysseus.requests) == 1
 
 

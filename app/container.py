@@ -37,6 +37,7 @@ class IrisContainer:
     alerter: OutboundAlerter
     plutus: ConsumerDispatchPort
     chronos: ConsumerDispatchPort
+    odysseus: ConsumerDispatchPort
     inbound: InboundEmailPipeline
 
 
@@ -78,6 +79,7 @@ def build_container(
     clock: Optional[ClockPort] = None,
     plutus_dispatcher: Optional[ConsumerDispatchPort] = None,
     chronos_dispatcher: Optional[ConsumerDispatchPort] = None,
+    odysseus_dispatcher: Optional[ConsumerDispatchPort] = None,
 ) -> IrisContainer:
     resolved_settings = settings_obj or settings
     adapter = ses_adapter or Boto3SesAdapter(
@@ -111,17 +113,25 @@ def build_container(
             webhook_secret=resolved_settings.CHRONOS_WEBHOOK_SECRET,
         )
     )
+    odysseus = odysseus_dispatcher or HttpConsumerDispatchAdapter(
+        ConsumerConfig(
+            consumer_name="odysseus",
+            api_url=resolved_settings.ODYSSEUS_API_URL,
+            webhook_secret=resolved_settings.ODYSSEUS_WEBHOOK_SECRET,
+        )
+    )
     inbound = InboundEmailPipeline(
         config=InboundConfig(
             confidence_threshold=resolved_settings.IRIS_ALERT_CONFIDENCE_THRESHOLD,
             plutus_dispatch_enabled=resolved_settings.IRIS_PLUTUS_DISPATCH_ENABLED,
             chronos_dispatch_enabled=resolved_settings.IRIS_CHRONOS_DISPATCH_ENABLED,
+            odysseus_dispatch_enabled=resolved_settings.IRIS_ODYSSEUS_DISPATCH_ENABLED,
         ),
         jev=jev,
-        consumers={"plutus": plutus, "chronos": chronos},
+        consumers={"plutus": plutus, "chronos": chronos, "odysseus": odysseus},
         alerter=alerter,
     )
     return IrisContainer(
         settings=resolved_settings, mailer=mailer, jev=jev, alerter=alerter,
-        plutus=plutus, chronos=chronos, inbound=inbound,
+        plutus=plutus, chronos=chronos, odysseus=odysseus, inbound=inbound,
     )

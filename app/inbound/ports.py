@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Protocol, runtim
 if TYPE_CHECKING:
     from app.db.models import InboundEmail
 
-ConsumerName = Literal["plutus", "chronos"]
+ConsumerName = Literal["plutus", "chronos", "odysseus"]
 ConsumerDispatchStatus = Literal["dispatched", "rejected", "unavailable"]
 PlutusDispatchStatus = ConsumerDispatchStatus
 InboundDisposition = Literal["dispatched", "duplicate", "ignored", "needs_review", "failed"]
@@ -24,6 +24,7 @@ class InboundConfig:
     confidence_threshold: float = 0.80
     plutus_dispatch_enabled: bool = False
     chronos_dispatch_enabled: bool = False
+    odysseus_dispatch_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,3 +100,4 @@ class ConsumerDispatchPort(Protocol):
 
 
 PlutusDispatchPort = ConsumerDispatchPort
+TravelDispatchPort = ConsumerDispatchPort
