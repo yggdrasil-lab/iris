@@ -10,6 +10,7 @@ RouteTargetType = Literal[
     "plutus_purchase_receipt",
     "plutus_payslip",
     "plutus_bank_statement",
+    "travel_booking",
     "actionable_notice",
     "ignore",
 ]
@@ -30,6 +31,8 @@ class EmailRouteVerdict(BaseModel):
     has_actionable_amount: bool
     has_schedule_event: bool = False
     schedule_confidence: Optional[float] = None
+    has_travel_booking: bool = False
+    travel_confidence: Optional[float] = None
     confidence: float
     urgency_score: int
     reason: str

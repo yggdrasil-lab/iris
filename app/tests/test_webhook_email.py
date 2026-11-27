@@ -980,3 +980,107 @@ def test_settings_strips_chronos_webhook_secret_whitespace() -> None:
     assert cfg.CHRONOS_WEBHOOK_SECRET == "chronos-trimmed-secret"
     assert cfg.IRIS_CHRONOS_DISPATCH_ENABLED is True
 
+
+def test_settings_strips_odysseus_webhook_secret_whitespace() -> None:
+    cfg = Settings(
+        _env_file=None,
+        ODYSSEUS_WEBHOOK_SECRET="  odysseus-trimmed-secret\n",
+        IRIS_ODYSSEUS_DISPATCH_ENABLED=True,
+    )
+    assert cfg.ODYSSEUS_WEBHOOK_SECRET == "odysseus-trimmed-secret"
+    assert cfg.IRIS_ODYSSEUS_DISPATCH_ENABLED is True
+
+
+def test_webhook_email_odysseus_travel_booking_and_dual_fanout(
+    make_harness: Callable[..., IrisTestHarness],
+) -> None:
+    jev = InMemoryJevClient(
+        responses=[
+            {
+                "route_target": "travel_booking",
+                "has_actionable_amount": False,
+                "has_schedule_event": False,
+                "has_travel_booking": True,
+                "significance_score": 6,
+                "_confidence": 0.93,
+            },
+            {
+                "route_target": "plutus_purchase_receipt",
+                "has_actionable_amount": True,
+                "has_schedule_event": True,
+                "has_travel_booking": True,
+                "significance_score": 8,
+                "_question_confidence": {
+                    "route_target": 0.95,
+                    "has_actionable_amount": 0.94,
+                    "has_schedule_event": 0.91,
+                    "has_travel_booking": 0.92,
+                },
+            },
+        ]
+    )
+    plutus = InMemoryPlutusDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="plutus-901")
+    )
+    chronos = InMemoryConsumerDispatcher(
+        default_result=ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-901")
+    )
+    odysseus = InMemoryConsumerDispatcher(
+        responses=[
+            ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-801"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="booking:bk-901"),
+        ]
+    )
+    h = make_harness(
+        settings_overrides={
+            "IRIS_PLUTUS_DISPATCH_ENABLED": True,
+            "IRIS_CHRONOS_DISPATCH_ENABLED": True,
+            "IRIS_ODYSSEUS_DISPATCH_ENABLED": True,
+        },
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+        chronos_dispatcher=chronos,
+        odysseus_dispatcher=odysseus,
+    )
+
+    travel_resp = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<hotel-pay-at-prop@example.com>",
+            "from_address": "reservations@hotel.example",
+            "to_address": "iris@example.com",
+            "subject": "Hotel Reservation Confirmed",
+            "text_body": "Pay at property stay for Alex Tan.",
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert travel_resp.status_code == 200
+    travel_body = travel_resp.json()
+    assert travel_body["route_target"] == "travel_booking"
+    assert travel_body["dispatch_status"] == "dispatched"
+    assert travel_body["consumer_ref"] == "booking:bk-801"
+    assert [d["consumer"] for d in travel_body["deliveries"]] == ["odysseus"]
+    assert plutus.requests == []
+    assert len(odysseus.requests) == 1
+
+    tri_resp = h.client.post(
+        "/webhook/email",
+        json={
+            "message_id": "<flight-tri-901@example.com>",
+            "from_address": "tickets@airline.example",
+            "to_address": "iris@example.com",
+            "subject": "Flight NZ901 E-Ticket Receipt",
+            "text_body": "Paid NZD 550.00. Departure 2026-12-15 10:00 for Alex Tan.",
+        },
+        headers={"Authorization": "Bearer test-iris-webhook-secret"},
+    )
+    assert tri_resp.status_code == 200
+    tri_body = tri_resp.json()
+    assert tri_body["dispatch_status"] == "dispatched"
+    assert {d["consumer"]: d["dispatch_status"] for d in tri_body["deliveries"]} == {
+        "plutus": "dispatched",
+        "chronos": "dispatched",
+        "odysseus": "dispatched",
+    }
+    assert tri_body["consumer_ref"] == "plutus:plutus-901, chronos:chronos-901, odysseus:booking:bk-901"
+

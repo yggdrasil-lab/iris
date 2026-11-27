@@ -3,6 +3,7 @@ export type RouteTargetType =
   | 'plutus_purchase_receipt'
   | 'plutus_payslip'
   | 'plutus_bank_statement'
+  | 'travel_booking'
   | 'actionable_notice'
   | 'ignore';
 
@@ -19,6 +20,8 @@ export interface JevVerdict {
   has_actionable_amount: boolean;
   has_schedule_event?: boolean;
   schedule_confidence?: number | null;
+  has_travel_booking?: boolean;
+  travel_confidence?: number | null;
   confidence: number;
   urgency_score: number;
   reason: string;
@@ -101,6 +104,7 @@ export const ROUTE_TARGET_OPTIONS: Array<{ value: RouteTargetType; label: string
   { value: 'plutus_purchase_receipt', label: 'Purchase Receipt' },
   { value: 'plutus_payslip', label: 'Payslip' },
   { value: 'plutus_bank_statement', label: 'Bank Statement' },
+  { value: 'travel_booking', label: 'Travel Booking (Odysseus)' },
   { value: 'actionable_notice', label: 'Actionable Notice' },
   { value: 'ignore', label: 'Ignore' },
 ];
@@ -110,6 +114,7 @@ export const ROUTE_TARGET_LABELS: Record<string, string> = {
   plutus_purchase_receipt: 'Purchase Receipt',
   plutus_payslip: 'Payslip',
   plutus_bank_statement: 'Bank Statement',
+  travel_booking: 'Travel Booking (Odysseus)',
   actionable_notice: 'Actionable Notice',
   ignore: 'Ignore',
   unclassified: 'Unclassified',

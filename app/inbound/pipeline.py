@@ -22,6 +22,7 @@ from app.inbound.ports import (
     ConsumerDispatchPort,
     ConsumerDispatchRequest,
     ConsumerDispatchResult,
+    ConsumerName,
     InboundActionResult,
     InboundConfig,
     InboundEmailNotFoundError,
@@ -62,6 +63,7 @@ class _RoutingContext:
     manual_reroute: bool
     is_retry: bool
     notify_operator: bool
+    has_travel_booking: bool = False
 
 
 def _verdict_from_row(row: InboundEmail) -> Optional[EmailRouteVerdict]:
@@ -217,6 +219,34 @@ def _resolve_schedule_detection(
     return schedule_confidence >= confidence_threshold, schedule_confidence
 
 
+def _resolve_travel_detection(
+    parsed: Mapping[str, Any],
+    route_target: str,
+    confidence_threshold: float,
+) -> Tuple[bool, Optional[float]]:
+    has_travel_flag = parse_bool(parsed.get("has_travel_booking", False))
+    if not has_travel_flag and route_target != "travel_booking":
+        return False, None
+    question_keys = ("has_travel_booking",) if has_travel_flag else ("route_target",)
+    travel_confidence = resolve_calibrated_confidence(
+        parsed, question_keys=question_keys, context_label="email_travel"
+    )
+    return travel_confidence >= confidence_threshold, travel_confidence
+
+
+_CONSUMER_ENABLED_ATTRS: tuple[Tuple[ConsumerName, str], ...] = (
+    ("plutus", "plutus_dispatch_enabled"),
+    ("chronos", "chronos_dispatch_enabled"),
+    ("odysseus", "odysseus_dispatch_enabled"),
+)
+
+_DISABLED_REASON_ORDER: tuple[Tuple[ConsumerName, str], ...] = (
+    ("plutus", "plutus_dispatch_disabled_phase1_capture"),
+    ("odysseus", "odysseus_dispatch_disabled"),
+    ("chronos", "chronos_dispatch_disabled"),
+)
+
+
 def _sync_email_scalar_status(
     email_row: InboundEmail,
     active_deliveries: Sequence[InboundEmailDelivery],
@@ -249,6 +279,24 @@ def _sync_email_scalar_status(
         )
 
 
+def _reconstruct_secondary_flags(
+    email_row: InboundEmail, target: str, cached: Optional[EmailRouteVerdict]
+) -> Tuple[bool, bool]:
+    if target == "ignore":
+        return False, False
+    has_sched = (
+        has_calendar_attachment(email_row.attachments_meta)
+        or bool(cached and cached.has_schedule_event)
+        or any(item.consumer == "chronos" for item in email_row.deliveries)
+    )
+    has_travel = (
+        target == "travel_booking"
+        or bool(cached and cached.has_travel_booking)
+        or any(item.consumer == "odysseus" for item in email_row.deliveries)
+    )
+    return has_sched, has_travel
+
+
 def _format_failure_alert_title(email_id: int, failed: Sequence[InboundEmailDelivery]) -> str:
     if len(failed) == 1:
         return f"{failed[0].consumer.capitalize()} Dispatch Failed: Email #{email_id}"
@@ -266,16 +314,16 @@ class InboundEmailPipeline:
         jev: JevClientPort,
         plutus: Optional[ConsumerDispatchPort] = None,
         chronos: Optional[ConsumerDispatchPort] = None,
+        odysseus: Optional[ConsumerDispatchPort] = None,
         consumers: Optional[Mapping[str, ConsumerDispatchPort]] = None,
         alerter: OutboundAlerter,
     ) -> None:
         self._config = config
         self._jev = jev
         resolved_consumers: Dict[str, ConsumerDispatchPort] = dict(consumers or {})
-        if plutus is not None:
-            resolved_consumers.setdefault("plutus", plutus)
-        if chronos is not None:
-            resolved_consumers.setdefault("chronos", chronos)
+        for name, adapter in (("plutus", plutus), ("chronos", chronos), ("odysseus", odysseus)):
+            if adapter is not None:
+                resolved_consumers.setdefault(name, adapter)
         self._consumers = resolved_consumers
         self._alerter = alerter
 
@@ -307,16 +355,21 @@ class InboundEmailPipeline:
         has_sched, sched_conf = _resolve_schedule_detection(
             parsed, attachments_meta, self._config.confidence_threshold
         )
+        has_travel, travel_conf = _resolve_travel_detection(
+            parsed, route_target, self._config.confidence_threshold
+        )
         return EmailRouteVerdict(
             route_target=route_target,  # type: ignore[arg-type]
             has_actionable_amount=has_amount,
             has_schedule_event=has_sched,
             schedule_confidence=sched_conf,
+            has_travel_booking=has_travel,
+            travel_confidence=travel_conf,
             confidence=conf,
             urgency_score=score,
             reason=(
                 f"Jev classified as {route_target} "
-                f"(amount={has_amount}, schedule={has_sched}, score={score}/10, conf={conf:.2f})"
+                f"(amount={has_amount}, schedule={has_sched}, travel={has_travel}, score={score}/10, conf={conf:.2f})"
             ),
             provider="muninn-jev",
         )
@@ -357,22 +410,27 @@ class InboundEmailPipeline:
             email=email_row, disposition="needs_review", delivery_unavailable=delivery_unavailable
         )
 
+    def _build_low_confidence_block(
+        self, email_row: InboundEmail, ctx: _RoutingContext
+    ) -> Tuple[Optional[str], str, str]:
+        threshold = self._config.confidence_threshold
+        return (
+            f"low_confidence: {ctx.confidence_value:.2f} < {threshold:.2f}",
+            f"Low-Confidence Email Needs Review: {email_row.subject or '(no subject)'}",
+            (
+                f"Email #{email_row.id} from {email_row.from_address}\n"
+                f"Suggested route: {ctx.route_target} (confidence {ctx.confidence_value:.2f})\n"
+                f"Reason: {ctx.verdict_reason}"
+            ),
+        )
+
     def _resolve_plutus_block(
         self, email_row: InboundEmail, ctx: _RoutingContext
     ) -> Optional[Tuple[Optional[str], str, str]]:
         if ctx.manual_reroute:
             return None
         if not ctx.route_confidence_ok:
-            threshold = self._config.confidence_threshold
-            return (
-                f"low_confidence: {ctx.confidence_value:.2f} < {threshold:.2f}",
-                f"Low-Confidence Email Needs Review: {email_row.subject or '(no subject)'}",
-                (
-                    f"Email #{email_row.id} from {email_row.from_address}\n"
-                    f"Suggested route: {ctx.route_target} (confidence {ctx.confidence_value:.2f})\n"
-                    f"Reason: {ctx.verdict_reason}"
-                ),
-            )
+            return self._build_low_confidence_block(email_row, ctx)
         guard = evaluate_evidence_guard(
             ctx.route_target,
             email_id=email_row.id,
@@ -470,13 +528,40 @@ class InboundEmailPipeline:
             )
         return active, failed, has_transient
 
-    def _enabled_consumers(self, *, wants_plutus: bool, wants_chronos: bool) -> List[str]:
-        enabled: List[str] = []
-        if wants_plutus and self._config.plutus_dispatch_enabled:
-            enabled.append("plutus")
-        if wants_chronos and self._config.chronos_dispatch_enabled:
-            enabled.append("chronos")
-        return enabled
+    def _enabled_consumers(
+        self,
+        *,
+        wants_plutus: bool,
+        wants_chronos: bool,
+        wants_odysseus: bool = False,
+    ) -> List[str]:
+        wanted: Dict[ConsumerName, bool] = {
+            "plutus": wants_plutus,
+            "chronos": wants_chronos,
+            "odysseus": wants_odysseus,
+        }
+        return [
+            consumer
+            for consumer, config_attr in _CONSUMER_ENABLED_ATTRS
+            if wanted[consumer] and getattr(self._config, config_attr)
+        ]
+
+    def _disabled_reason(
+        self,
+        *,
+        wants_plutus: bool,
+        wants_chronos: bool,
+        wants_odysseus: bool,
+    ) -> str:
+        wanted: Dict[ConsumerName, bool] = {
+            "plutus": wants_plutus,
+            "chronos": wants_chronos,
+            "odysseus": wants_odysseus,
+        }
+        for consumer, reason in _DISABLED_REASON_ORDER:
+            if wanted[consumer]:
+                return reason
+        return "consumer_dispatch_disabled"
 
     async def _handle_non_consumer_route(
         self, db: Session, email_row: InboundEmail, ctx: _RoutingContext
@@ -511,10 +596,15 @@ class InboundEmailPipeline:
         plutus_block: Tuple[Optional[str], str, str],
         ctx: _RoutingContext,
     ) -> InboundActionResult:
+        secondary_consumers = self._enabled_consumers(
+            wants_plutus=False,
+            wants_chronos=ctx.has_schedule_event,
+            wants_odysseus=ctx.has_travel_booking,
+        )
         has_transient = False
-        if ctx.has_schedule_event and self._config.chronos_dispatch_enabled:
+        if secondary_consumers:
             _, _, has_transient = await self._fanout_to_consumers(
-                db, email_row, ["chronos"], is_retry=ctx.is_retry, notify_operator=ctx.notify_operator
+                db, email_row, secondary_consumers, is_retry=ctx.is_retry, notify_operator=ctx.notify_operator
             )
         return await self._park_for_review(
             db, email_row, error_detail=plutus_block[0], title=plutus_block[1],
@@ -527,21 +617,29 @@ class InboundEmailPipeline:
     ) -> InboundActionResult:
         spec = get_route_spec(ctx.route_target)
         email_row.route_target = spec.target
-        if not spec.dispatches_to_plutus and not ctx.has_schedule_event:
+        wants_plutus = "plutus" in spec.fanout_targets
+        wants_odysseus = ("odysseus" in spec.fanout_targets) or ctx.has_travel_booking
+        wants_chronos = ctx.has_schedule_event
+        if not wants_plutus and not wants_odysseus and not wants_chronos:
             return await self._handle_non_consumer_route(db, email_row, ctx)
 
-        plutus_block = self._resolve_plutus_block(email_row, ctx) if spec.dispatches_to_plutus else None
-        if plutus_block is not None:
-            return await self._park_plutus_block(db, email_row, plutus_block, ctx)
+        if wants_plutus:
+            plutus_block = self._resolve_plutus_block(email_row, ctx)
+            if plutus_block is not None:
+                return await self._park_plutus_block(db, email_row, plutus_block, ctx)
+        elif "odysseus" in spec.fanout_targets and not ctx.manual_reroute and not ctx.route_confidence_ok:
+            low_conf_block = self._build_low_confidence_block(email_row, ctx)
+            return await self._park_for_review(
+                db, email_row, error_detail=low_conf_block[0], title=low_conf_block[1],
+                details=low_conf_block[2], notify_decisions=ctx.notify_operator,
+            )
 
         consumers = self._enabled_consumers(
-            wants_plutus=spec.dispatches_to_plutus, wants_chronos=ctx.has_schedule_event
+            wants_plutus=wants_plutus, wants_chronos=wants_chronos, wants_odysseus=wants_odysseus
         )
         if not consumers:
-            reason = (
-                "plutus_dispatch_disabled_phase1_capture"
-                if spec.dispatches_to_plutus
-                else "chronos_dispatch_disabled"
+            reason = self._disabled_reason(
+                wants_plutus=wants_plutus, wants_chronos=wants_chronos, wants_odysseus=wants_odysseus
             )
             return await self._park_for_review(
                 db, email_row, error_detail=reason, title="", details="", notify_decisions=False
@@ -584,6 +682,7 @@ class InboundEmailPipeline:
             route_target=verdict.route_target,
             has_actionable_amount=verdict.has_actionable_amount,
             has_schedule_event=verdict.has_schedule_event,
+            has_travel_booking=verdict.has_travel_booking,
             route_confidence_ok=(verdict.confidence >= self._config.confidence_threshold),
             confidence_value=verdict.confidence,
             verdict_reason=verdict.reason,
@@ -633,14 +732,13 @@ class InboundEmailPipeline:
                 db, email_row, manual_reroute=False, is_retry=True, notify_operator=False
             )
         cached = _verdict_from_row(email_row)
-        has_sched = (
-            has_calendar_attachment(email_row.attachments_meta)
-            or bool(cached and cached.has_schedule_event)
-            or any(item.consumer == "chronos" for item in email_row.deliveries)
+        has_sched, has_travel = _reconstruct_secondary_flags(
+            email_row, email_row.route_target, cached
         )
         ctx = _RoutingContext(
             route_target=email_row.route_target,  # type: ignore[arg-type]
-            has_actionable_amount=True, has_schedule_event=has_sched, route_confidence_ok=True,
+            has_actionable_amount=True, has_schedule_event=has_sched,
+            has_travel_booking=has_travel, route_confidence_ok=True,
             confidence_value=cached.confidence if cached else 1.0,
             verdict_reason=cached.reason if cached else "",
             manual_reroute=True, is_retry=True, notify_operator=False,
@@ -658,14 +756,11 @@ class InboundEmailPipeline:
         email_row.retry_count += 1
         email_row.error_detail = None
         cached = _verdict_from_row(email_row)
-        has_sched = spec.target != "ignore" and (
-            has_calendar_attachment(email_row.attachments_meta)
-            or bool(cached and cached.has_schedule_event)
-            or any(item.consumer == "chronos" for item in email_row.deliveries)
-        )
+        has_sched, has_travel = _reconstruct_secondary_flags(email_row, spec.target, cached)
         ctx = _RoutingContext(
             route_target=spec.target, has_actionable_amount=True, has_schedule_event=has_sched,
-            route_confidence_ok=True, confidence_value=1.0, verdict_reason="Operator manual reroute",
+            has_travel_booking=has_travel, route_confidence_ok=True, confidence_value=1.0,
+            verdict_reason="Operator manual reroute",
             manual_reroute=True, is_retry=True, notify_operator=False,
         )
         return await self._apply_routing_and_dispatch(db, email_row, ctx)

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from app.inbound.ports import InvalidRouteTargetError
+from app.inbound.ports import ConsumerName, InvalidRouteTargetError
 from app.models.schemas import RouteTargetType
 
 GuardMode = Literal["amount_required", "amount_or_document"]
@@ -13,6 +13,7 @@ class RouteSpec:
     target: RouteTargetType
     jev_criteria: str
     dispatches_to_plutus: bool = False
+    fanout_targets: tuple[ConsumerName, ...] = ()
     guard_mode: Optional[GuardMode] = None
     guard_error_code: Optional[str] = None
     guard_title_prefix: Optional[str] = None
@@ -34,6 +35,7 @@ ROUTE_CATALOG: Dict[str, RouteSpec] = {
             "card charge, PayNow, FAST transfer, bill payment, or GIRO notification"
         ),
         dispatches_to_plutus=True,
+        fanout_targets=("plutus",),
     ),
     "plutus_purchase_receipt": RouteSpec(
         target="plutus_purchase_receipt",
@@ -43,6 +45,7 @@ ROUTE_CATALOG: Dict[str, RouteSpec] = {
             "(containing an itemized or total spend, or emails with attached invoice/receipt PDFs or images such as TaxInvoice.pdf or SI_*.jpg)"
         ),
         dispatches_to_plutus=True,
+        fanout_targets=("plutus",),
         guard_mode="amount_required",
         guard_error_code="receipt_missing_actionable_amount",
         guard_title_prefix="Receipt Needs Review",
@@ -56,6 +59,7 @@ ROUTE_CATALOG: Dict[str, RouteSpec] = {
             "even when the email body contains zero dollar figures"
         ),
         dispatches_to_plutus=True,
+        fanout_targets=("plutus",),
         guard_mode="amount_or_document",
         guard_error_code="payslip_missing_attachment",
         guard_title_prefix="Payslip Needs Review",
@@ -65,6 +69,17 @@ ROUTE_CATALOG: Dict[str, RouteSpec] = {
         target="plutus_bank_statement",
         jev_criteria="Bank or credit card statement notification or attached statement PDF/CSV",
         dispatches_to_plutus=True,
+        fanout_targets=("plutus",),
+    ),
+    "travel_booking": RouteSpec(
+        target="travel_booking",
+        jev_criteria=(
+            "Non-payment travel booking or itinerary confirmation without a paid receipt total: "
+            "flight itinerary, boarding pass, pay-at-property hotel reservation, car rental confirmation, "
+            "rail or ferry ticket, activity or tour voucher, or travel insurance confirmation"
+        ),
+        dispatches_to_plutus=False,
+        fanout_targets=("odysseus",),
     ),
     "actionable_notice": RouteSpec(
         target="actionable_notice",
@@ -104,6 +119,13 @@ _SCHEDULE_EVENT_INSTRUCTIONS = (
     "False if there is no concrete scheduled event or time-bound booking."
 )
 
+_TRAVEL_BOOKING_INSTRUCTIONS = (
+    "True if the email is a travel reservation, booking confirmation, or travel document "
+    "(flight itinerary, boarding pass, hotel or accommodation reservation, car rental, rail or ferry ticket, "
+    "activity or tour voucher, or travel insurance confirmation) whether or not it includes a payment total; "
+    "False if it is not a travel booking or trip reservation."
+)
+
 _SIGNIFICANCE_SCORE_CRITERIA = [
     "Marketing promo, newsletter, OTP code, or shipping tracking noise with no financial or action relevance",
     "Low-priority informational email without urgent financial or operator action",
@@ -139,6 +161,10 @@ def build_inbound_email_questions() -> Dict[str, Any]:
         "has_schedule_event": {
             "type": "noul",
             "instructions": _SCHEDULE_EVENT_INSTRUCTIONS,
+        },
+        "has_travel_booking": {
+            "type": "noul",
+            "instructions": _TRAVEL_BOOKING_INSTRUCTIONS,
         },
         "significance_score": {
             "type": "score",

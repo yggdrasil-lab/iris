@@ -36,6 +36,7 @@ from app.inbound.ports import (
     PlutusDispatchRequest,
     PlutusDispatchResult,
     PlutusDispatchStatus,
+    TravelDispatchPort,
 )
 from app.inbound.sanitizer import (
     MAX_RAW_EXCERPT_CHARS,
@@ -78,6 +79,7 @@ __all__ = [
     "PlutusDispatchStatus",
     "ROUTE_CATALOG",
     "RouteSpec",
+    "TravelDispatchPort",
     "VALID_ROUTE_TARGETS",
     "build_inbound_email_questions",
     "build_inbound_email_state_text",

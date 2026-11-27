@@ -35,6 +35,7 @@ class IrisTestHarness:
     jev: JevClientPort
     plutus: PlutusDispatchPort
     chronos: ConsumerDispatchPort
+    odysseus: ConsumerDispatchPort
     discord: InMemoryDiscordTransport
     ses: InMemorySesAdapter
     clock: FakeClock
@@ -62,6 +63,9 @@ def build_test_settings(database_url: str, **overrides: Any) -> Settings:
         "IRIS_CHRONOS_DISPATCH_ENABLED": False,
         "CHRONOS_API_URL": "http://chronos-api:8000",
         "CHRONOS_WEBHOOK_SECRET": "chronos-secret",
+        "IRIS_ODYSSEUS_DISPATCH_ENABLED": False,
+        "ODYSSEUS_API_URL": "http://odysseus-api:8000",
+        "ODYSSEUS_WEBHOOK_SECRET": "odysseus-secret",
         "IRIS_ALERT_CONFIDENCE_THRESHOLD": 0.80,
     }
     defaults.update(overrides)
@@ -106,6 +110,7 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
         jev_client: Optional[JevClientPort] = None,
         plutus_dispatcher: Optional[PlutusDispatchPort] = None,
         chronos_dispatcher: Optional[ConsumerDispatchPort] = None,
+        odysseus_dispatcher: Optional[ConsumerDispatchPort] = None,
         discord_transport: Optional[InMemoryDiscordTransport] = None,
         ses_adapter: Optional[InMemorySesAdapter] = None,
         clock: Optional[FakeClock] = None,
@@ -123,6 +128,16 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
                 )
             )
         )
+        odysseus = (
+            odysseus_dispatcher
+            if odysseus_dispatcher is not None
+            else InMemoryConsumerDispatcher(
+                default_result=ConsumerDispatchResult(
+                    status="dispatched",
+                    consumer_ref="booking:odysseus-1",
+                )
+            )
+        )
         discord = discord_transport if discord_transport is not None else InMemoryDiscordTransport()
         ses = ses_adapter if ses_adapter is not None else InMemorySesAdapter()
         clk = clock if clock is not None else FakeClock()
@@ -134,6 +149,7 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
             clock=clk,
             plutus_dispatcher=plutus,
             chronos_dispatcher=chronos,
+            odysseus_dispatcher=odysseus,
         )
         test_app = create_app(container)
         test_client = stack.enter_context(TestClient(test_app))
@@ -145,6 +161,7 @@ def make_harness(isolated_db_url: str) -> Iterator[Callable[..., IrisTestHarness
             jev=jev,
             plutus=plutus,
             chronos=chronos,
+            odysseus=odysseus,
             discord=discord,
             ses=ses,
             clock=clk,

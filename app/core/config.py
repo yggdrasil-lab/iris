@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     CHRONOS_WEBHOOK_SECRET: Optional[str] = None
     IRIS_CHRONOS_DISPATCH_ENABLED: bool = False
 
+    # Odysseus internal overlay consumer dispatch
+    ODYSSEUS_API_URL: str = "http://odysseus-api:8000"
+    ODYSSEUS_WEBHOOK_SECRET: Optional[str] = None
+    IRIS_ODYSSEUS_DISPATCH_ENABLED: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -72,6 +77,7 @@ class Settings(BaseSettings):
             "MUNINN_API_KEY",
             "PLUTUS_WEBHOOK_SECRET",
             "CHRONOS_WEBHOOK_SECRET",
+            "ODYSSEUS_WEBHOOK_SECRET",
         ):
             val = getattr(self, field_name)
             if isinstance(val, str):
