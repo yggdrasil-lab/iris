@@ -1084,3 +1084,168 @@ def test_webhook_email_odysseus_travel_booking_and_dual_fanout(
     }
     assert tri_body["consumer_ref"] == "plutus:plutus-901, chronos:chronos-901, odysseus:booking:bk-901"
 
+
+def _make_replay_harness(
+    make_harness: Callable[..., IrisTestHarness],
+    chronos_responses: list[ConsumerDispatchResult],
+    odysseus_responses: list[ConsumerDispatchResult],
+) -> tuple[IrisTestHarness, InMemoryJevClient, InMemoryPlutusDispatcher, InMemoryConsumerDispatcher, InMemoryConsumerDispatcher]:
+    jev = InMemoryJevClient(
+        default_response={
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "has_schedule_event": True,
+            "has_travel_booking": True,
+            "significance_score": 8,
+            "_confidence": 0.94,
+        }
+    )
+    plutus = InMemoryPlutusDispatcher(
+        responses=[ConsumerDispatchResult(status="dispatched", consumer_ref="receipt:10")]
+    )
+    chronos = InMemoryConsumerDispatcher(responses=chronos_responses)
+    odysseus = InMemoryConsumerDispatcher(responses=odysseus_responses)
+    harness = make_harness(
+        settings_overrides={
+            "IRIS_PLUTUS_DISPATCH_ENABLED": True,
+            "IRIS_CHRONOS_DISPATCH_ENABLED": True,
+            "IRIS_ODYSSEUS_DISPATCH_ENABLED": True,
+        },
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+        chronos_dispatcher=chronos,
+        odysseus_dispatcher=odysseus,
+    )
+    return harness, jev, plutus, chronos, odysseus
+
+
+def test_webhook_email_duplicate_replays_only_failed_deliveries(
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
+) -> None:
+    h, jev, plutus, chronos, odysseus = _make_replay_harness(
+        make_harness,
+        chronos_responses=[
+            ConsumerDispatchResult(status="unavailable", error_detail="chronos_503: down"),
+            ConsumerDispatchResult(status="unavailable", error_detail="chronos_503: still down"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="chronos-evt-10"),
+        ],
+        odysseus_responses=[
+            ConsumerDispatchResult(status="unavailable", error_detail="odysseus_503: down"),
+            ConsumerDispatchResult(status="dispatched", consumer_ref="booking:ABC123"),
+        ],
+    )
+    payload = {
+        "message_id": "<flight-replay-abc123@airline.example.com>",
+        "from_address": "flight@airline.example.com",
+        "to_address": "iris@example.com",
+        "subject": "Flight ABC123 Itinerary",
+        "text_body": "Paid NZD 420.00 for Alex Tan. Departure 2026-12-20 08:15.",
+    }
+    headers = {"Authorization": "Bearer test-iris-webhook-secret"}
+
+    first = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert first.status_code == 503
+    assert first.json()["dispatch_status"] == "failed"
+
+    second = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert second.status_code == 503
+    assert second.json()["dispatch_status"] == "failed"
+    assert second.json()["duplicate"] is False
+    assert {d["consumer"]: d["dispatch_status"] for d in second.json()["deliveries"]} == {
+        "plutus": "dispatched",
+        "chronos": "failed",
+        "odysseus": "dispatched",
+    }
+
+    third = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["duplicate"] is False
+    assert third_body["status"] == "dispatched"
+    assert third_body["dispatch_status"] == "dispatched"
+    assert third_body["consumer_ref"] == "plutus:receipt:10, chronos:chronos-evt-10, odysseus:booking:ABC123"
+
+    fourth = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert fourth.status_code == 200
+    assert fourth.json()["duplicate"] is True
+    assert fourth.json()["status"] == "duplicate"
+
+    assert len(jev.calls) == 1
+    assert len(plutus.requests) == 1
+    assert len(odysseus.requests) == 2
+    assert len(chronos.requests) == 3
+
+    saved = db_session.scalar(
+        select(InboundEmail).where(InboundEmail.message_id == payload["message_id"])
+    )
+    assert saved is not None
+    assert saved.retry_count == 2
+
+
+def test_webhook_email_duplicate_replays_failed_jev_unavailable(
+    make_harness: Callable[..., IrisTestHarness],
+    db_session: Session,
+) -> None:
+    attempts = 0
+
+    def jev_handler(_state: str, _questions: dict) -> dict:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise JevRouterUnavailableError("muninn jev timeout")
+        return {
+            "route_target": "plutus_purchase_receipt",
+            "has_actionable_amount": True,
+            "significance_score": 7,
+            "_confidence": 0.93,
+        }
+
+    jev = InMemoryJevClient(handler=jev_handler)
+    plutus = InMemoryPlutusDispatcher(
+        responses=[ConsumerDispatchResult(status="dispatched", consumer_ref="receipt:77")]
+    )
+    h = make_harness(
+        settings_overrides={"IRIS_PLUTUS_DISPATCH_ENABLED": True},
+        jev_client=jev,
+        plutus_dispatcher=plutus,
+    )
+    payload = {
+        "message_id": "<jev-retry-77@merchant.example.com>",
+        "from_address": "receipts@merchant.example.com",
+        "to_address": "iris@example.com",
+        "subject": "Order Receipt ABC123",
+        "text_body": "Paid NZD 55.00 by Alex Tan.",
+    }
+    headers = {"Authorization": "Bearer test-iris-webhook-secret"}
+
+    first = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert first.status_code == 503
+    assert first.json()["dispatch_status"] == "failed"
+    assert first.json()["jev_verdict"] is None
+    assert plutus.requests == []
+
+    second = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["duplicate"] is False
+    assert second_body["status"] == "dispatched"
+    assert second_body["dispatch_status"] == "dispatched"
+    assert second_body["consumer_ref"] == "receipt:77"
+    assert len(jev.calls) == 2
+    assert len(plutus.requests) == 1
+
+    third = h.client.post("/webhook/email", json=payload, headers=headers)
+    assert third.status_code == 200
+    assert third.json()["duplicate"] is True
+    assert third.json()["status"] == "duplicate"
+    assert len(jev.calls) == 2
+    assert len(plutus.requests) == 1
+
+    saved = db_session.scalar(
+        select(InboundEmail).where(InboundEmail.message_id == payload["message_id"])
+    )
+    assert saved is not None
+    assert saved.retry_count == 1
+
+
