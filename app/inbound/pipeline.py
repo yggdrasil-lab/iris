@@ -709,22 +709,9 @@ class InboundEmailPipeline:
             )
         return InboundActionResult(email=email_row, disposition="failed", delivery_unavailable=True)
 
-    async def ingest(self, db: Session, payload: InboundEmailWebhookPayload) -> InboundActionResult:
-        """Persist, classify, and dispatch an inbound email idempotently."""
-        email_row, is_duplicate = _persist_inbound_email(db, payload)
-        if is_duplicate:
-            return InboundActionResult(email=email_row, disposition="duplicate", duplicate=True)
-        return await self._classify_and_dispatch(
-            db, email_row, manual_reroute=False, is_retry=False, notify_operator=True
-        )
-
-    async def retry(
-        self, db: Session, email_id: int, *, reclassify: bool = False
+    async def _replay_email(
+        self, db: Session, email_row: InboundEmail, *, reclassify: bool
     ) -> InboundActionResult:
-        """Retry dispatching an inbound email, optionally re-running Jev classification."""
-        email_row = self.get_email_with_attachments(db, email_id)
-        if email_row is None:
-            raise InboundEmailNotFoundError(f"Inbound email {email_id} not found")
         email_row.retry_count += 1
         email_row.error_detail = None
         if reclassify or not is_valid_route_target(email_row.route_target) or not email_row.jev_verdict:
@@ -746,6 +733,26 @@ class InboundEmailPipeline:
             manual_reroute=True, is_retry=True, notify_operator=False,
         )
         return await self._apply_routing_and_dispatch(db, email_row, ctx)
+
+    async def ingest(self, db: Session, payload: InboundEmailWebhookPayload) -> InboundActionResult:
+        """Persist, classify, and dispatch an inbound email idempotently."""
+        email_row, is_duplicate = _persist_inbound_email(db, payload)
+        if is_duplicate:
+            if email_row.dispatch_status == "failed":
+                return await self._replay_email(db, email_row, reclassify=False)
+            return InboundActionResult(email=email_row, disposition="duplicate", duplicate=True)
+        return await self._classify_and_dispatch(
+            db, email_row, manual_reroute=False, is_retry=False, notify_operator=True
+        )
+
+    async def retry(
+        self, db: Session, email_id: int, *, reclassify: bool = False
+    ) -> InboundActionResult:
+        """Retry dispatching an inbound email, optionally re-running Jev classification."""
+        email_row = self.get_email_with_attachments(db, email_id)
+        if email_row is None:
+            raise InboundEmailNotFoundError(f"Inbound email {email_id} not found")
+        return await self._replay_email(db, email_row, reclassify=reclassify)
 
     async def reroute(
         self, db: Session, email_id: int, *, new_target: RouteTargetType
